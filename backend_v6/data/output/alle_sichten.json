@@ -1,0 +1,172 @@
+{
+  "schema": "kommunalspiegel.alle_sichten.v6",
+  "version": "6.0.0",
+  "generated_at": "2026-06-01T20:24:49.773421+00:00",
+  "statistik": {
+    "kommunen_gesamt": 1,
+    "kommunen_mit_api_daten": 0
+  },
+  "datenquellen": {
+    "s4": {
+      "name": "BNetzA Ladesäulenregister",
+      "typ": "XLSX-Download",
+      "rhythmus": "täglich",
+      "url": "https://www.bundesnetzagentur.de/DE/Fachthemen/ElektrizitaetundGas/E-Mobilitaet/start.html",
+      "key": "kein Key nötig"
+    },
+    "s5": {
+      "name": "BNetzA Breitbandatlas",
+      "typ": "XLSX-Download",
+      "rhythmus": "halbjährlich",
+      "url": "https://gigabitgrundbuch.bund.de/GIGA/DE/Downloads_Suche/start.html",
+      "key": "kein Key nötig"
+    },
+    "s6": {
+      "name": "BNetzA Mobilfunk-Monitoring",
+      "typ": "XLSX-Download",
+      "rhythmus": "halbjährlich",
+      "url": "https://gigabitgrundbuch.bund.de/GIGA/DE/Downloads_Suche/aktuell/Auswertung_Mobilfunkmonitoring.xlsx",
+      "key": "kein Key nötig"
+    },
+    "s3": {
+      "name": "Google StreetView Metadata",
+      "typ": "REST API",
+      "rhythmus": "monatlich",
+      "url": "https://maps.googleapis.com/maps/api/streetview/metadata",
+      "key": "GOOGLE_MAPS_API_KEY (kostenlos, console.cloud.google.com)"
+    },
+    "s2_9_10": {
+      "name": "OSM Overpass API",
+      "typ": "REST API",
+      "rhythmus": "täglich",
+      "url": "https://overpass-api.de/api/interpreter",
+      "key": "kein Key nötig"
+    },
+    "s7": {
+      "name": "OZG-Umsetzungsstand",
+      "typ": "Benchmark-CSV + opt. manuelle Datei",
+      "key": "kein Key nötig"
+    },
+    "s8": {
+      "name": "Meta Graph API",
+      "typ": "REST API",
+      "rhythmus": "wöchentlich",
+      "url": "https://graph.facebook.com/v19.0",
+      "key": "META_ACCESS_TOKEN (developers.facebook.com)"
+    },
+    "s1": {
+      "name": "Claude API PDF-Parsing",
+      "typ": "LLM API",
+      "rhythmus": "jährlich/manuell",
+      "url": "https://api.anthropic.com/v1/messages",
+      "key": "ANTHROPIC_API_KEY (console.anthropic.com)"
+    }
+  },
+  "kommunen": [
+    {
+      "name": "Leuna",
+      "landkreis": "Saalekreis",
+      "einwohner": 14500,
+      "ags": "15088075",
+      "scores": {
+        "s2": 5.12,
+        "s3": 9.3,
+        "s4": 8.97,
+        "s5": 7.46,
+        "s6": 4.12,
+        "s7": 8.29,
+        "s8": 9.43,
+        "strategie": 5.0,
+        "plattform": 7.21,
+        "netzwerk": 9.43,
+        "gesamt": 6.99
+      },
+      "sichten": {
+        "3": {
+          "api": null,
+          "benchmark": {
+            "pct": 93.01
+          },
+          "status": "benchmark",
+          "score": 9.3,
+          "quelle": "Benchmark CSV 2024"
+        },
+        "4": {
+          "api": null,
+          "benchmark": {
+            "lp_pro_1000": 3.59,
+            "quelle": "CSV 2024"
+          },
+          "status": "benchmark",
+          "score": 8.97,
+          "quelle": "Benchmark CSV 2024",
+          "via": "fallback"
+        },
+        "5": {
+          "api": null,
+          "benchmark": {
+            "mbit_s": 447.67,
+            "quelle": "CSV 2024"
+          },
+          "status": "benchmark",
+          "score": 7.46,
+          "quelle": "Benchmark CSV 2024"
+        },
+        "6": {
+          "api": null,
+          "benchmark": {
+            "data": {
+              "o2": -90.4,
+              "voda": -95.99,
+              "tele": -81.86
+            },
+            "avg_dbm": -89.42,
+            "quelle": "CSV 2024 (dBm)"
+          },
+          "status": "benchmark",
+          "score": 4.12,
+          "quelle": "Benchmark CSV 2024"
+        },
+        "7": {
+          "api": null,
+          "benchmark": {
+            "rg": 3.24,
+            "ab2": 84.85,
+            "quelle": "CSV 2024"
+          },
+          "status": "benchmark",
+          "score": 8.29,
+          "quelle": "Benchmark CSV 2024"
+        },
+        "8": {
+          "api": null,
+          "benchmark": {
+            "kd": 5.66,
+            "quelle": "CSV 2024"
+          },
+          "status": "benchmark",
+          "score": 9.43,
+          "quelle": "Benchmark CSV 2024 (kein META_TOKEN)"
+        }
+      },
+      "osm": {
+        "s2": {
+          "api": null,
+          "benchmark": {
+            "tp": 0.41
+          },
+          "status": "benchmark"
+        },
+        "s9": {
+          "api": null,
+          "status": "benchmark"
+        },
+        "s10": {
+          "api": null,
+          "status": "benchmark"
+        },
+        "quelle": "Benchmark CSV 2024"
+      }
+    }
+  ]
+}

@@ -1,0 +1,117 @@
+{
+  "schema": "kommunalspiegel.kommunen_seed.v1",
+  "version": "1.2.0-top3-demo",
+  "created_at": "2026-06-02",
+  "description": "Zentrale Seed-Datei begrenzt auf 3 Benchmark-Kommunen für schnellen Demo-Lauf: Leuna, Querfurt, Bad Dürrenberg.",
+  "notes": [
+    "Aktive Laufmenge absichtlich auf 3 Benchmark-Kommunen begrenzt, um Nominatim/Overpass/Mapillary-Rate-Limits im Demo-Betrieb zu vermeiden.",
+    "Naumburg ist nicht enthalten, weil es nicht Teil des verwendeten Benchmarks ist.",
+    "Die API-Skripte lesen diese Seed-Datei; dadurch laufen Sicht 2, Sicht 4 und Sicht 10 einheitlich für dieselben 3 Kommunen.",
+    "Sicht 2 Benchmark: virtuelle Touren gemäß Projektregel mindestens 3 Aufnahmen/Blickpunkte.",
+    "Sicht 4 Benchmark: Ladepunkte pro 1.000 Einwohner aus manueller Erhebung.",
+    "Sicht 10 Benchmark: Schulabdeckung 10min, Kita-Abdeckung 10min, Gewerbefläche m²/1.000 EW; fehlende Werte können später ergänzt werden."
+  ],
+  "sources": {
+    "kommunen_basis": "bisherige Projekt-Seed-Listen in sync_sicht2/sync_sicht4/sync_sicht10",
+    "coordinates": "bisherige Projekt-Seed-Koordinaten",
+    "benchmarks": "studentische manuelle Erhebung 2024/2025, soweit im Projektstand hinterlegt"
+  },
+  "kommunen": [
+    {
+      "name": "Leuna",
+      "landkreis": "Saalekreis",
+      "bundesland": "Sachsen-Anhalt",
+      "ags": "15088205",
+      "ags_status": "vorhanden_im_bisherigen_seed",
+      "einwohner": 14500,
+      "center": {
+        "lat": 51.3286,
+        "lng": 12.0032
+      },
+      "active": true,
+      "project_region": "suedliches_sachsen_anhalt",
+      "benchmarks": {
+        "sicht2_virtuelle_touren": {
+          "touren_pro_1000_ew": 0.41,
+          "touren_count": 8,
+          "regel": "Standort zählt nur als virtuelle Tour, wenn mindestens 3 Aufnahmen/Blickpunkte vorhanden sind.",
+          "source": "studentische manuelle Erhebung 2024/2025"
+        },
+        "sicht4_ladeinfrastruktur": {
+          "ladepunkte_pro_1000_ew": 3.59,
+          "source": "studentische manuelle Erhebung 2024/2025"
+        },
+        "sicht10_daseinsvorsorge": {
+          "school_coverage_percent": null,
+          "kita_coverage_percent": null,
+          "commercial_area_m2_per_1000_ew": null,
+          "source": "manuelle studentische Erhebung; Werte können aus CSV/JSON ergänzt werden"
+        }
+      }
+    },
+    {
+      "name": "Querfurt",
+      "landkreis": "Saalekreis",
+      "bundesland": "Sachsen-Anhalt",
+      "ags": null,
+      "ags_status": "offen_verifizieren",
+      "einwohner": 12800,
+      "center": {
+        "lat": 51.3803,
+        "lng": 11.5897
+      },
+      "active": true,
+      "project_region": "suedliches_sachsen_anhalt",
+      "benchmarks": {
+        "sicht2_virtuelle_touren": {
+          "touren_pro_1000_ew": 0.4,
+          "touren_count": 5,
+          "regel": "Standort zählt nur als virtuelle Tour, wenn mindestens 3 Aufnahmen/Blickpunkte vorhanden sind.",
+          "source": "studentische manuelle Erhebung 2024/2025"
+        },
+        "sicht4_ladeinfrastruktur": {
+          "ladepunkte_pro_1000_ew": 0.504,
+          "source": "studentische manuelle Erhebung 2024/2025"
+        },
+        "sicht10_daseinsvorsorge": {
+          "school_coverage_percent": null,
+          "kita_coverage_percent": null,
+          "commercial_area_m2_per_1000_ew": null,
+          "source": "manuelle Vergleichswerte noch nicht hinterlegt"
+        }
+      }
+    },
+    {
+      "name": "Bad Dürrenberg",
+      "landkreis": "Saalekreis",
+      "bundesland": "Sachsen-Anhalt",
+      "ags": null,
+      "ags_status": "offen_verifizieren",
+      "einwohner": 9800,
+      "center": {
+        "lat": 51.2965,
+        "lng": 12.0645
+      },
+      "active": true,
+      "project_region": "suedliches_sachsen_anhalt",
+      "benchmarks": {
+        "sicht2_virtuelle_touren": {
+          "touren_pro_1000_ew": 0.61,
+          "touren_count": 6,
+          "regel": "Standort zählt nur als virtuelle Tour, wenn mindestens 3 Aufnahmen/Blickpunkte vorhanden sind.",
+          "source": "studentische manuelle Erhebung 2024/2025"
+        },
+        "sicht4_ladeinfrastruktur": {
+          "ladepunkte_pro_1000_ew": 2.95,
+          "source": "studentische manuelle Erhebung 2024/2025"
+        },
+        "sicht10_daseinsvorsorge": {
+          "school_coverage_percent": null,
+          "kita_coverage_percent": null,
+          "commercial_area_m2_per_1000_ew": null,
+          "source": "manuelle Vergleichswerte noch nicht hinterlegt"
+        }
+      }
+    }
+  ]
+}
