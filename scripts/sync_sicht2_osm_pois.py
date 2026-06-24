@@ -439,11 +439,15 @@ def bbox_for_radius(lat: float, lng: float, radius_m: int) -> Tuple[float, float
 
 def mapillary_count_images(lat: float, lng: float, token: str, radius_m: int = 90, limit: int = 10) -> Tuple[int, List[str]]:
     # Mapillary Graph API v4 images endpoint. Requires access token.
+    # is_pano=true: nur echte 360°-Panoramen zählen (Definition laut Spezifikation:
+    # "mindestens drei 360° Bilder miteinander zu einer Tour verbunden" — eine
+    # normale Flachaufnahme zählt NICHT als 360°-Bild).
     west, south, east, north = bbox_for_radius(lat, lng, radius_m)
     params = {
         "access_token": token,
-        "fields": "id,computed_geometry,captured_at,thumb_256_url",
+        "fields": "id,computed_geometry,captured_at,is_pano,thumb_256_url",
         "bbox": f"{west},{south},{east},{north}",
+        "is_pano": "true",
         "limit": limit,
     }
     r = requests.get(MAPILLARY_IMAGES_URL, params=params, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
@@ -451,6 +455,8 @@ def mapillary_count_images(lat: float, lng: float, token: str, radius_m: int = 9
     data = r.json()
     ids = []
     for item in data.get("data", []):
+        if not item.get("is_pano"):
+            continue  # serverseitiger Filter sollte das bereits ausschließen, sicherheitshalber doppelt prüfen
         iid = item.get("id")
         if iid:
             ids.append(str(iid))
@@ -468,12 +474,12 @@ def verify_virtual_tours(cands: List[Candidate], token: Optional[str], min_image
                 c.mapillary_image_count = count
                 if count >= min_images:
                     c.verified_virtual_tour = True
-                    c.verification_method = "mapillary_min_3_images"
+                    c.verification_method = "mapillary_min_3_pano_images"
                     c.evidence = (c.evidence or []) + [f"Mapillary:{iid}" for iid in image_ids[:min_images]]
                 else:
-                    c.verification_method = "mapillary_less_than_3_images"
+                    c.verification_method = "mapillary_less_than_3_pano_images"
                 if debug:
-                    log(f"  Mapillary {idx}/{len(cands)}: {c.name} → {count} Bild(er)")
+                    log(f"  Mapillary {idx}/{len(cands)}: {c.name} → {count} 360°-Aufnahme(n)")
                 time.sleep(0.15)
                 continue
             except Exception as e:
@@ -549,7 +555,7 @@ def sync_kommune(kommune: Dict[str, Any], force_boundary: bool=False, debug: boo
     candidates = dedupe_candidates(all_cands)
     verification_available = bool(mapillary_token) or allow_osm_evidence
     if mapillary_token:
-        log(f"{name}: Mapillary-Prüfung ≥{min_images} Aufnahmen je Standort")
+        log(f"{name}: Mapillary-Prüfung ≥{min_images} 360°-Aufnahmen je Standort")
     elif allow_osm_evidence:
         log(f"{name}: OSM-Evidence-Prüfung ≥{min_images} Hinweise je Standort")
     else:
@@ -627,7 +633,7 @@ def push_to_supabase(results: List[Dict[str, Any]]) -> None:
                     "wert_num": per1000,
                     "score_normiert": None,
                     "erhebungsjahr": jahr,
-                    "quelle": "OpenStreetMap Overpass API + Mapillary (≥3 Aufnahmen je Standort)",
+                    "quelle": "OpenStreetMap Overpass API + Mapillary (≥3 echte 360°-Aufnahmen je Standort)",
                     "quelle_typ": "automatisch",
                     "letzter_abruf": datetime.now(timezone.utc).isoformat(),
                 }, on_conflict="kommune_id,sicht_nr,kennzahl,erhebungsjahr").execute()
