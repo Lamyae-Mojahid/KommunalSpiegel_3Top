@@ -707,6 +707,7 @@ def aggregate(k: Dict[str, Any], all_points: List[Ladepunkt], boundary: Optional
     sample = [point_dict(p) for p in selected[:500]]
     return {
         "kommune": k["name"], "landkreis": k.get("lk"), "einwohner": ew, "ags": k.get("ags"),
+        "_alle_ladepunkte": selected,
         "api": {"ladeeinrichtungen": len(selected), "ladepunkte_gesamt": total, "ladepunkte_ac": ac, "ladepunkte_dc": dc, "ladepunkte_pro_1000_ew": pro1000, "boundary_ok": boundary is not None, "boundary_source": boundary.get("source") if boundary else None, "osm_display_name": (boundary or {}).get("display_name")},
         "benchmark": {"ladepunkte_pro_1000_ew": bm, "quelle": "studentische manuelle Erhebung 2024/2025", "benchmark_ratio": ratio},
         "status": status, "status_message": msg, "score_s4": score,
@@ -730,10 +731,62 @@ def make_fallback(error: str, diagnostics: Optional[Dict[str, Any]]=None) -> Dic
     return {"schema":SCHEMA, "version":VERSION, "generated_at":datetime.now(timezone.utc).isoformat(), "source":{"name":"Benchmark-Fallback", "api_status":"fehler", "error":error, "download_pages":BNETZA_PAGE_URLS}, "diagnostics":diagnostics or {}, "statistik":{"kommunen_gesamt":len(kommunen), "kommunen_api":0, "kommunen_gemischt":0, "kommunen_benchmark":len(kommunen), "ladepunkte_api_gesamt":0, "verwertbare_ladepunkte":0}, "qualitaetsregeln":{"api":">=80% Benchmark", "gemischt":"40–80% Benchmark", "benchmark":"<40%, Fehler oder keine Grenze", "neu":"kein Benchmark vorhanden"}, "kommunen":kommunen}
 
 
+def _json_safe(obj: Any) -> Any:
+    """Entfernt interne, nicht JSON-serialisierbare Hilfsfelder (z. B. die
+    vollständige Ladepunkt-Liste, die nur für den Supabase-Push gebraucht wird)."""
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items() if k != "_alle_ladepunkte"}
+    if isinstance(obj, list):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
 def write_json(path: Path, obj: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    path.write_text(json.dumps(_json_safe(obj), ensure_ascii=False, indent=2), encoding="utf-8")
     log(f"✓ JSON geschrieben: {path}")
+
+
+def push_ladesaeulen_to_supabase(sb, kommune_id: int, name: str, ladepunkte: List[Ladepunkt], jahr: int) -> None:
+    """Schreibt jede einzelne Ladesäule für eine Kommune in die Tabelle
+    'ladesaeulen' — für die spätere Kartenansicht. Wie bei streetview_routes:
+    alte Zeilen für (kommune_id, erhebungsjahr) zuerst löschen, dann neu
+    einfügen, damit ein erneuter Lauf keine Duplikate erzeugt.
+    """
+    try:
+        sb.table("ladesaeulen").delete().eq("kommune_id", kommune_id).eq("erhebungsjahr", jahr).execute()
+    except Exception as e:
+        log(f"  ⚠ {name}: Löschen alter ladesaeulen-Zeilen fehlgeschlagen: {e}")
+
+    if not ladepunkte:
+        return
+
+    rows = [{
+        "kommune_id": kommune_id,
+        "betreiber": p.betreiber or None,
+        "adresse": p.adresse or None,
+        "plz": p.plz or None,
+        "ort": p.ort or None,
+        "lat": p.lat,
+        "lng": p.lng,
+        "anzahl_ladepunkte": p.anzahl,
+        "art": p.art or None,
+        "leistung_kw": p.leistung_kw,
+        "steckertypen": p.steckertypen or None,
+        "inbetriebnahme": p.inbetriebnahme or None,
+        "erhebungsjahr": jahr,
+    } for p in ladepunkte]
+
+    batch_size = 500
+    gespeichert = 0
+    for i in range(0, len(rows), batch_size):
+        batch = rows[i:i + batch_size]
+        try:
+            sb.table("ladesaeulen").insert(batch).execute()
+            gespeichert += len(batch)
+            log(f"  {name}: {gespeichert}/{len(rows)} Ladesäulen gespeichert")
+        except Exception as e:
+            log(f"  ✗ {name}: Fehler beim Speichern von Ladesäulen (Batch {i}): {e}")
 
 
 def push_to_supabase(summaries: List[Dict[str, Any]]) -> None:
@@ -778,6 +831,9 @@ def push_to_supabase(summaries: List[Dict[str, Any]]) -> None:
             }, on_conflict="kommune_id,sicht_nr,kennzahl,erhebungsjahr").execute()
             gepusht += 1
             log(f"  ✓ {name}: {pro1000} Ladepunkte/1000 EW → Supabase")
+
+            alle_punkte = s.get("_alle_ladepunkte", [])
+            push_ladesaeulen_to_supabase(sb, kommune_id, name, alle_punkte, jahr)
         except Exception as e:
             log(f"  ✗ {name}: Supabase-Fehler: {e}")
     log(f"Supabase: {gepusht}/{len(KOMMUNE_IDS)} Pilotkommunen aktualisiert")
