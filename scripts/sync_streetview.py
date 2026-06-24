@@ -154,46 +154,55 @@ def calculate_coverage(commune):
     if not roads:
         return None, []
 
-    all_points = []
-    for road in roads:
-        all_points.extend(interpolate_points(road, SAMPLE_INTERVAL))
+    # Punkte PRO STRASSE interpolieren — die Reihenfolge innerhalb einer
+    # Straße bleibt erhalten, damit Segmente später nur entlang derselben
+    # Straße gebildet werden (nicht quer über mehrere Straßen hinweg).
+    roads_points = [interpolate_points(road, SAMPLE_INTERVAL) for road in roads]
+    roads_points = [pts for pts in roads_points if len(pts) >= 1]
 
-    seen = set()
-    unique_points = []
-    for pt in all_points:
-        key = (round(pt[0], 4), round(pt[1], 4))
-        if key not in seen:
-            seen.add(key)
-            unique_points.append(pt)
-
-    if not unique_points:
+    if not roads_points:
         return None, []
 
-    log.info(f"{name}: {len(unique_points)} points sur routes à vérifier")
-    covered_set = set()
-    total = len(unique_points)
+    # Abdeckungsprüfung bleibt global dedupliziert (gleicher Punkt taucht
+    # manchmal auf mehreren Straßen auf — nicht doppelt bei Google abfragen).
+    # Wichtig: NUR für die Coverage-Prüfung dedupliziert, NICHT für den
+    # Segmentaufbau — die Straßenreihenfolge bleibt unten unverändert.
+    coverage_cache: dict = {}
+    total_unique_points = len(set((round(p[0], 4), round(p[1], 4)) for pts in roads_points for p in pts))
+    checked = 0
 
-    for i, (pt_lat, pt_lng) in enumerate(unique_points):
-        if has_streetview(pt_lat, pt_lng):
-            covered_set.add(i)
+    def is_covered(lat, lng):
+        nonlocal checked
+        key = (round(lat, 4), round(lng, 4))
+        if key in coverage_cache:
+            return coverage_cache[key]
+        result = has_streetview(lat, lng)
+        coverage_cache[key] = result
         time.sleep(PAUSE)
-        if (i + 1) % 50 == 0:
-            log.info(f"{name}: {i+1}/{total} ({len(covered_set)} couverts)")
+        checked += 1
+        if checked % 50 == 0:
+            covered_so_far = sum(1 for v in coverage_cache.values() if v)
+            log.info(f"{name}: {checked}/{total_unique_points} ({covered_so_far} couverts)")
+        return result
 
     segments = []
-    for i in range(len(unique_points) - 1):
-        lat1, lng1 = unique_points[i]
-        lat2, lng2 = unique_points[i + 1]
-        segments.append({
-            'lat_start': round(lat1, 6), 'lng_start': round(lng1, 6),
-            'lat_end': round(lat2, 6), 'lng_end': round(lng2, 6),
-            'covered': i in covered_set or (i + 1) in covered_set,
-        })
+    for pts in roads_points:
+        covered_flags = [is_covered(lat, lng) for lat, lng in pts]
+        for i in range(len(pts) - 1):
+            lat1, lng1 = pts[i]
+            lat2, lng2 = pts[i + 1]
+            segments.append({
+                'lat_start': round(lat1, 6), 'lng_start': round(lng1, 6),
+                'lat_end': round(lat2, 6), 'lng_end': round(lng2, 6),
+                'covered': covered_flags[i] or covered_flags[i + 1],
+            })
 
-    pct = round((len(covered_set) / total) * 100, 2)
+    total = len(coverage_cache)
+    covered_count = sum(1 for v in coverage_cache.values() if v)
+    pct = round((covered_count / total) * 100, 2) if total else 0.0
     score = min(10.0, max(0.0, round(pct / 10, 1)))
-    log.info(f"{name}: {len(covered_set)}/{total} → {pct}% (score: {score})")
-    return {'pct': pct, 'score': score, 'total_points': total, 'covered_points': len(covered_set)}, segments
+    log.info(f"{name}: {covered_count}/{total} → {pct}% (score: {score})")
+    return {'pct': pct, 'score': score, 'total_points': total, 'covered_points': covered_count}, segments
 
 def update_supabase(supabase, commune, result, segments):
     commune_name = commune['name']
