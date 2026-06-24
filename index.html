@@ -784,12 +784,224 @@ svg { display: block; }
 <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" crossorigin="anonymous"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
 
 <script type="text/babel">
 const { useState, useEffect, useMemo, useRef } = React;
 
 /* global React */
 /* entfernt: doppelte React-Hook-Deklaration */
+
+/* ═══════════════════════════════════════════════════════════════
+   SUPABASE · Verbindung + Hilfsfunktionen für Sicht 3 & Sicht 4
+   Nur der anon-Key wird hier verwendet (öffentlich, nur Lesezugriff
+   dank Row-Level-Security in Supabase) — niemals den service_role-Key
+   im Frontend verwenden.
+   ═══════════════════════════════════════════════════════════════ */
+const SUPABASE_URL = 'https://ninaqklavqpolzekzwdw.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5pbmFxa2xhdnFwb2x6ZWt6d2R3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODIyMDM3NzIsImV4cCI6MjA5Nzc3OTc3Mn0.15xevZVwXpl2cXqVSR_5c5o_cirsZ46l9vaf6WT0ELU';
+const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+const KOMMUNE_ID_BY_NAME = { 'Leuna': 1, 'Querfurt': 2, 'Bad Dürrenberg': 3 };
+
+/* Lädt alle Ladesäulen aus Supabase und formt sie in die Struktur um,
+   die Sicht4LiveinfrastrukturView bereits erwartet
+   (data.kommunen[].points / .ladepunkte_gesamt / .status usw.) */
+async function fetchSicht4FromSupabase() {
+  const { data: rows, error } = await sb
+    .from('ladesaeulen')
+    .select('*')
+    .order('kommune_id', { ascending: true });
+  if (error) throw error;
+
+  const { data: benchRows } = await sb
+    .from('benchmark')
+    .select('*')
+    .eq('sicht_nr', 4)
+    .eq('quelle_typ', 'automatisch')
+    .order('erhebungsjahr', { ascending: false });
+
+  const kommunen = Object.entries(KOMMUNE_ID_BY_NAME).map(([name, id]) => {
+    const punkte = (rows || []).filter(r => r.kommune_id === id);
+    const bench = (benchRows || []).find(b => b.kommune_id === id);
+    const total = punkte.reduce((a, p) => a + (p.anzahl_ladepunkte || 1), 0);
+    const dc = punkte.filter(p => p.art === 'DC').reduce((a, p) => a + (p.anzahl_ladepunkte || 1), 0);
+    return {
+      kommune: name,
+      ladeeinrichtungen: punkte.length,
+      ladepunkte_gesamt: total,
+      ladepunkte_ac: total - dc,
+      ladepunkte_dc: dc,
+      ladepunkte_pro_1000_ew: bench?.wert_num ?? null,
+      boundary_ok: punkte.length > 0,
+      status: bench ? 'api' : 'benchmark',
+      status_message: bench
+        ? `Live aus Supabase · zuletzt aktualisiert ${bench.letzter_abruf ? new Date(bench.letzter_abruf).toLocaleString('de-DE') : ''}`
+        : 'Noch keine automatischen Daten in Supabase',
+      points: punkte.map(p => ({
+        id: p.id,
+        name: p.betreiber,
+        betreiber: p.betreiber,
+        lat: p.lat,
+        lng: p.lng,
+        art: p.art,
+        leistung_kw: p.leistung_kw,
+        anzahl_ladepunkte: p.anzahl_ladepunkte,
+        adresse: p.adresse,
+        stecker: p.steckertypen,
+        quelle: 'Bundesnetzagentur Ladesäulenregister',
+      })),
+    };
+  });
+
+  return { generated_at: benchRows?.[0]?.letzter_abruf || new Date().toISOString(), kommunen };
+}
+
+/* Lädt E-Bike/E-Scooter-Ladestationen aus Supabase (Tabelle 2 der Sicht-4-
+   Spezifikation). Eigene OSM-Quelle, da BNetzA nur E-Autos erfasst. */
+async function fetchSicht4bEbikeFromSupabase(kommuneName) {
+  const id = KOMMUNE_ID_BY_NAME[kommuneName];
+  if (!id) return [];
+  const { data, error } = await sb
+    .from('ebike_ladestationen')
+    .select('*')
+    .eq('kommune_id', id);
+  if (error) throw error;
+  return (data || []).map(s => ({
+    adresse: s.adresse || s.name || '—',
+    anzahl_ladeplaetze: s.anzahl_ladeplaetze ?? 1,
+    leistung_kw: s.leistung_kw,
+    anbieter: s.betreiber || '—',
+    fahrzeugart: s.fahrzeugart || '—',
+    lat: s.lat,
+    lng: s.lng,
+  }));
+}
+
+   Jedes Segment wird als eigene 2-Punkt-"Linie" dargestellt — optisch
+   identisch zu durchgehenden Linien, da Segmente lückenlos aneinander
+   anschließen. */
+async function fetchAllRows(table, extraQuery) {
+  const pageSize = 1000;
+  let from = 0;
+  let all = [];
+  while (true) {
+    let q = sb.from(table).select('*').range(from, from + pageSize - 1);
+    if (extraQuery) q = extraQuery(q);
+    const { data, error } = await q;
+    if (error) throw error;
+    all = all.concat(data || []);
+    if (!data || data.length < pageSize) break;
+    from += pageSize;
+  }
+  return all;
+}
+
+async function fetchSicht3FromSupabase() {
+  const rows = await fetchAllRows('streetview_routes', q => q.order('kommune_id', { ascending: true }));
+
+  const { data: benchRows } = await sb
+    .from('benchmark')
+    .select('*')
+    .eq('sicht_nr', 3)
+    .order('erhebungsjahr', { ascending: false });
+
+  const kommunen = Object.entries(KOMMUNE_ID_BY_NAME).map(([name, id]) => {
+    const segs = (rows || []).filter(r => r.kommune_id === id);
+    const toLine = s => ({
+      coords: [[s.lat_start, s.lng_start], [s.lat_end, s.lng_end]],
+      length_m: null,
+      highway: '',
+      name: '',
+    });
+
+    const autoRow = (benchRows || []).find(b => b.kommune_id === id && b.quelle_typ === 'automatisch');
+    const manualRow = (benchRows || []).find(b => b.kommune_id === id && b.quelle_typ === 'manuell');
+
+    const roadsTotal = segs.length;
+    const roadsCovered = segs.filter(s => s.covered).length;
+    const hitRate = roadsTotal ? Math.round((roadsCovered / roadsTotal) * 1000) / 10 : null;
+    const pct = autoRow?.wert_num ?? hitRate;
+
+    return {
+      kommune: name,
+      road_lines: segs.map(toLine),
+      blue_lines: segs.filter(s => s.covered).map(toLine),
+      coverage_percent: pct,
+      status: autoRow ? 'api' : (roadsTotal ? 'lokal' : 'nicht synchronisiert'),
+      roads_total: roadsTotal,
+      roads_checked: roadsTotal,
+      coverage_of_checked_percent: pct,
+      covered_percent: pct,
+      benchmark_percent: manualRow?.wert_num ?? null,
+      metadata_samples: roadsTotal,
+      metadata_ok: roadsCovered,
+      metadata_hit_rate_percent: hitRate,
+      extrapolated_percent: pct,
+    };
+  });
+
+  return { generated_at: (benchRows || []).find(b => b.quelle_typ === 'automatisch')?.letzter_abruf || new Date().toISOString(), kommunen };
+}
+
+/* Lädt alle touren_punkte aus Supabase und formt sie in die Struktur um,
+   die Sicht2ApiView bereits erwartet (data.kommunen[].candidates /
+   .verified_tours / .status / .verified_tour_count usw.) */
+async function fetchSicht2FromSupabase() {
+  const rows = await fetchAllRows('touren_punkte', q => q.order('kommune_id', { ascending: true }));
+
+  const { data: benchRows } = await sb
+    .from('benchmark')
+    .select('*')
+    .eq('sicht_nr', 2)
+    .order('erhebungsjahr', { ascending: false });
+
+  const toPoint = p => ({
+    name: p.name || p.category_label || 'POI',
+    category: p.category_label || p.category || 'POI',
+    lat: p.lat,
+    lng: p.lng,
+    osm_type: p.osm_type,
+    osm_id: p.osm_id,
+    verified: p.verified,
+    mapillary_image_count: p.mapillary_image_count,
+  });
+
+  const kommunen = Object.entries(KOMMUNE_ID_BY_NAME).map(([name, id]) => {
+    const pts = (rows || []).filter(r => r.kommune_id === id);
+    const verified = pts.filter(p => p.verified);
+    const candidates = pts; // alle Kandidaten, verifiziert oder nicht
+
+    const catsOf = list => list.reduce((acc, p) => {
+      const cat = p.category_label || p.category || 'Sonstige';
+      acc[cat] = (acc[cat] || 0) + 1;
+      return acc;
+    }, {});
+
+    const autoRow = (benchRows || []).find(b => b.kommune_id === id && b.quelle_typ === 'automatisch');
+    const manualRow = (benchRows || []).find(b => b.kommune_id === id && b.quelle_typ === 'manuell');
+
+    return {
+      kommune: name,
+      status: autoRow ? 'api_live' : (pts.length ? 'lokal' : 'benchmark'),
+      candidates: candidates.map(toPoint),
+      candidate_points: candidates.map(toPoint),
+      verified_tours: verified.map(toPoint),
+      verified_points: verified.map(toPoint),
+      points: verified.map(toPoint),
+      categories_candidates: catsOf(candidates),
+      categories_verified: catsOf(verified),
+      candidate_count: candidates.length,
+      verified_tour_count: verified.length,
+      benchmark_count: manualRow?.wert_num != null ? Math.round(manualRow.wert_num * 100) / 100 : null,
+      api_pois_pro_1000_ew: autoRow?.wert_num ?? null,
+      quality_ratio: manualRow?.wert_num ? (autoRow?.wert_num ?? 0) / manualRow.wert_num : null,
+    };
+  });
+
+  return { generated_at: (benchRows || []).find(b => b.quelle_typ === 'automatisch')?.letzter_abruf || new Date().toISOString(), kommunen };
+}
+
 
 /* ═══════════════════════════════════════════════════════════════
    KOMMSCAN · DATEN
@@ -1994,16 +2206,15 @@ function Sicht4LiveLadeMap({ kommune, benchmarkValue, score }) {
   const pro1000 = entry?.ladepunkte_pro_1000_ew ?? entry?.api?.ladepunkte_pro_1000_ew ?? (meta?.einwohner ? total/(meta.einwohner/1000) : null);
   const bm = entry?.benchmark_ladepunkte_pro_1000_ew ?? entry?.benchmark?.ladepunkte_pro_1000_ew ?? benchmarkValue;
   const status = entry?.status || 'nicht synchronisiert';
-  const statusMsg = entry?.status_message || 'Sicht-4-Daten werden aus data/sicht4_ladeinfrastruktur.json gelesen.';
+  const statusMsg = entry?.status_message || 'Sicht-4-Daten werden live aus Supabase gelesen.';
   const generated = data?.generated_at ? new Date(data.generated_at).toLocaleString('de-DE') : '—';
 
   React.useEffect(() => {
     let cancel = false;
     setError(null);
-    fetch('data/sicht4_ladeinfrastruktur.json', {cache:'no-store'})
-      .then(r => { if(!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+    fetchSicht4FromSupabase()
       .then(j => { if(!cancel) setData(j); })
-      .catch(e => { if(!cancel) setError(`Sicht-4-JSON nicht gefunden oder nicht lesbar: ${e.message}`); });
+      .catch(e => { if(!cancel) setError(`Supabase-Daten für Sicht 4 nicht ladbar: ${e.message}`); });
     return () => { cancel = true; };
   }, []);
 
@@ -2984,8 +3195,20 @@ function KarteView({ kommune }) {
   const [activeL, setActiveL] = React.useState(new Set(["orts","lade"]));
   const [s4Data, setS4Data] = React.useState(null);
   const [s4Error, setS4Error] = React.useState(null);
+  const [ebikeStations, setEbikeStations] = React.useState([]);
+  const [ebikeError, setEbikeError] = React.useState(null);
 
   const kommuneName = kommune || 'Leuna';
+
+  React.useEffect(() => {
+    let cancel = false;
+    setEbikeError(null);
+    fetchSicht4bEbikeFromSupabase(kommuneName)
+      .then(rows => { if (!cancel) setEbikeStations(rows); })
+      .catch(e => { if (!cancel) { setEbikeError(e.message); setEbikeStations([]); } });
+    return () => { cancel = true; };
+  }, [kommuneName]);
+
   const kommuneMeta = KOMMUNEN.find(k => k.name === kommuneName) || KOMMUNEN.find(k => k.name === 'Leuna') || KOMMUNEN[0];
   const s4Kommune = s4Data?.kommunen?.find(k => k.kommune === kommuneName)
     || s4Data?.kommunen?.find(k => String(k.kommune || '').replace(' (Geiseltal)','') === String(kommuneName || '').replace(' (Geiseltal)',''));
@@ -2996,6 +3219,8 @@ function KarteView({ kommune }) {
     lng: Number(p.lng),
     typ: `${p.art || 'Ladeeinrichtung'}${p.leistung_kw ? ' · '+p.leistung_kw+' kW' : ''}`,
     anz: p.anzahl_ladepunkte || 1,
+    leistung_kw: p.leistung_kw ?? null,
+    anbieter: p.betreiber || p.name || '—',
     status: s4Kommune.status === 'amtlich/live' ? 'live' : s4Kommune.status === 'gemischt/pruefen' ? 'geprueft' : 'auto',
     quelle: p.quelle || 'BNetzA CSV',
     adresse: p.adresse || '',
@@ -3011,15 +3236,11 @@ function KarteView({ kommune }) {
   React.useEffect(() => {
     let cancel = false;
     setS4Error(null);
-    fetch('data/sicht4_ladeinfrastruktur.json', {cache:'no-store'})
-      .then(r => {
-        if(!r.ok) throw new Error(`HTTP ${r.status}`);
-        return r.json();
-      })
+    fetchSicht4FromSupabase()
       .then(json => { if(!cancel) setS4Data(json); })
       .catch(err => {
         if(!cancel) {
-          setS4Error(`Sicht-4-JSON nicht geladen: ${err.message}. Es werden Benchmark-Daten angezeigt.`);
+          setS4Error(`Supabase-Daten für Sicht 4 nicht geladen: ${err.message}. Es werden Benchmark-Daten angezeigt.`);
           setS4Data(null);
         }
       });
@@ -3148,24 +3369,48 @@ function KarteView({ kommune }) {
         </div>
       </div>
       <div className="card mb">
-        <div className="card-head"><span className="card-title">Sicht 4 · Ladepunkte für {kommuneName}</span></div>
+        <div className="card-head"><span className="card-title">Sicht 4 · Tabelle 1 · E-Autos/E-Motorräder · {kommuneName}</span></div>
+        <p style={{fontSize:12,color:'var(--ink-4)',padding:'0 16px 8px'}}>Spalten gemäß Spezifikation: Ort der Ladestation, Anzahl der Ladeplätze, Ladegeschwindigkeit (kW), Anbieter.</p>
         <div style={{overflowX:'auto'}}>
           <table className="data-table">
-            <thead><tr><th>Objekt</th><th>Typ</th><th>Ladepunkte</th><th>Koordinaten</th><th>Status</th><th>Quelle</th></tr></thead>
+            <thead><tr><th>Ort der Ladestation</th><th>Anzahl Ladeplätze</th><th>Geschwindigkeit (kW)</th><th>Anbieter</th><th>Koordinaten</th><th>Status</th></tr></thead>
             <tbody>
               {ladepunkte.slice(0,50).map((p,i) => (
                 <tr key={i}>
-                  <td style={{fontWeight:600}}>{p.name}</td>
-                  <td><span className="tag">{p.typ}</span></td>
+                  <td style={{fontWeight:600}}>{p.adresse || p.name}</td>
                   <td className="num">{p.anz}</td>
+                  <td className="num">{p.leistung_kw != null ? p.leistung_kw : '—'}</td>
+                  <td>{p.anbieter}</td>
                   <td className="mono" style={{fontSize:11}}>{p.lat.toFixed(5)}, {p.lng.toFixed(5)}</td>
                   <td><span className={`status-badge st-${p.status==='live'?'live':p.status==='geprueft'?'geprueft':p.status==='auto'?'auto':'manu'}`}>{p.status}</span></td>
-                  <td style={{fontSize:11,color:'var(--ink-4)'}}>{p.quelle}</td>
                 </tr>
               ))}
               {!ladepunkte.length && <tr><td colSpan="6" style={{color:'var(--ink-4)'}}>Keine Ladepunkte gefunden und kein Benchmark vorhanden.</td></tr>}
             </tbody>
           </table>
+        </div>
+      </div>
+      <div className="card mb">
+        <div className="card-head"><span className="card-title">Sicht 4 · Tabelle 2 · E-Bikes/E-Scooter · {kommuneName}</span></div>
+        <p style={{fontSize:12,color:'var(--ink-4)',padding:'0 16px 8px'}}>Quelle: OpenStreetMap (amenity=charging_station, bicycle/scooter=yes) — die Bundesnetzagentur erfasst nur E-Autos/E-Motorräder, daher separate Quelle für diese Kategorie.</p>
+        {ebikeError && <p style={{fontSize:12,color:'var(--warn)',padding:'0 16px 8px'}}>Fehler beim Laden: {ebikeError}</p>}
+        <div style={{overflowX:'auto'}}>
+          <table className="data-table">
+            <thead><tr><th>Ort der Ladestation</th><th>Anzahl Ladeplätze</th><th>Geschwindigkeit (kW)</th><th>Anbieter</th><th>Fahrzeugart</th></tr></thead>
+            <tbody>
+              {ebikeStations.slice(0,50).map((s,i) => (
+                <tr key={i}>
+                  <td style={{fontWeight:600}}>{s.adresse}</td>
+                  <td className="num">{s.anzahl_ladeplaetze}</td>
+                  <td className="num">{s.leistung_kw != null ? s.leistung_kw : '—'}</td>
+                  <td>{s.anbieter}</td>
+                  <td><span className="tag">{s.fahrzeugart}</span></td>
+                </tr>
+              ))}
+              {!ebikeStations.length && !ebikeError && <tr><td colSpan="5" style={{color:'var(--ink-4)'}}>Keine E-Bike/E-Scooter-Ladestationen in OpenStreetMap gefunden.</td></tr>}
+            </tbody>
+          </table>
+
         </div>
       </div>
     </div>
@@ -3970,6 +4215,20 @@ function useApiJson(path) {
   }, [path]);
   return state;
 }
+/* Gleicher {loading,data,error}-Vertrag wie useApiJson, aber Quelle ist
+   eine Supabase-Abfrage statt einer lokalen JSON-Datei. */
+function useSupabaseJson(fetchFn) {
+  const [state, setState] = React.useState({loading:true, data:null, error:null});
+  React.useEffect(() => {
+    let cancel = false;
+    setState({loading:true, data:null, error:null});
+    fetchFn()
+      .then(data => { if(!cancel) setState({loading:false, data, error:null}); })
+      .catch(err => { if(!cancel) setState({loading:false, data:null, error:err.message}); });
+    return () => { cancel = true; };
+  }, []);
+  return state;
+}
 function findApiKommune(data, kommune) {
   return data?.kommunen?.find(x => x.kommune === kommune)
       || data?.kommunen?.find(x => String(x.kommune || '').replace(' (Geiseltal)','') === String(kommune || '').replace(' (Geiseltal)',''))
@@ -3984,7 +4243,7 @@ function ApiNotice({error, fallbackText}) {
 }
 
 function Sicht2ApiView({ kommune }) {
-  const {loading, data, error} = useApiJson('data/sicht2_pois.json');
+  const {loading, data, error} = useSupabaseJson(fetchSicht2FromSupabase);
   const k = KOMMUNEN.find(x => x.name === kommune) || KOMMUNEN[0];
   const row = findApiKommune(data, kommune);
   const candidates = row?.candidates || row?.candidate_points || [];
@@ -4225,10 +4484,9 @@ function Sicht3StreetviewLiveView({ kommune, setTab }) {
   }, [kommune]);
 
   React.useEffect(() => {
-    fetch('data/sicht3_streetview.json', {cache:'no-store'})
-      .then(r => { if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+    fetchSicht3FromSupabase()
       .then(j => setData(j))
-      .catch(e => setErr('Sicht-3-JSON nicht gefunden. Bitte zuerst sync_sicht3_streetview_google.py ausführen.'));
+      .catch(e => setErr(`Supabase-Daten für Sicht 3 nicht ladbar: ${e.message}`));
   }, []);
 
   const all = data?.kommunen || [];

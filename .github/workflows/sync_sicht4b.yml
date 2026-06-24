@@ -1,0 +1,31 @@
+name: Sync S4b E-Bike Ladestationen
+
+on:
+  schedule:
+    - cron: '0 8 1 * *'   # monatlich, am 1. des Monats, 08:00 UTC
+  workflow_dispatch:
+
+jobs:
+  sync-ebike-ladestationen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          pip install requests supabase
+
+      - name: Run E-Bike Ladestationen sync
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          python scripts/sync_sicht4b_ebike_ladestationen.py
