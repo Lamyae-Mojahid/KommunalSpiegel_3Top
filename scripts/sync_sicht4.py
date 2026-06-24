@@ -36,8 +36,20 @@ from urllib.parse import urljoin
 import requests
 from kommunen_seed_loader import load_seed, seed_kommunen, seed_benchmark_s4, seed_benchmark_s2, seed_benchmark_s10
 
+try:
+    from supabase import create_client
+except ImportError:
+    create_client = None
+
 VERSION = "6.0.0"
 SCHEMA = "kommunalspiegel.sicht4_ladeinfrastruktur.v6"
+
+# ── Supabase: feste kommune_id-Zuordnung für die 3 Pilotkommunen ────
+KOMMUNE_IDS = {
+    "Leuna": 1,
+    "Querfurt": 2,
+    "Bad Dürrenberg": 3,
+}
 
 BNETZA_PAGE_URLS = [
     "https://www.bundesnetzagentur.de/Ladesaeulenkarte",
@@ -724,6 +736,53 @@ def write_json(path: Path, obj: Dict[str, Any]) -> None:
     log(f"✓ JSON geschrieben: {path}")
 
 
+def push_to_supabase(summaries: List[Dict[str, Any]]) -> None:
+    """Schreibt die Sicht-4-Ergebnisse (Ladepunkte pro 1000 EW) als neue,
+    automatisch erzeugte Zeile in die Supabase-Tabelle 'benchmark'.
+    Bestehende manuelle Zeilen (quelle_typ='manuell', erhebungsjahr=2025)
+    bleiben unverändert — es wird nur eine Zeile mit erhebungsjahr=aktuelles
+    Jahr und quelle_typ='automatisch' hinzugefügt/aktualisiert.
+    """
+    url = os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL")
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_SERVICE_KEY")
+    if not url or not key:
+        log("Supabase nicht konfiguriert (SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY fehlen) — kein Push.")
+        return
+    if create_client is None:
+        log("Python-Paket 'supabase' nicht installiert — kein Push. (pip install supabase)")
+        return
+
+    sb = create_client(url, key)
+    jahr = datetime.now().year
+    gepusht = 0
+    for s in summaries:
+        name = s.get("kommune")
+        kommune_id = KOMMUNE_IDS.get(name)
+        if kommune_id is None:
+            continue  # nicht eine unserer 3 Pilotkommunen
+        pro1000 = s.get("ladepunkte_pro_1000_ew")
+        if pro1000 is None:
+            log(f"  ⚠ {name}: kein Live-Wert (Status={s.get('status')}) — überspringe Push")
+            continue
+        try:
+            sb.table("benchmark").upsert({
+                "kommune_id": kommune_id,
+                "sicht_nr": 4,
+                "kennzahl": "Ladepunkte pro Tsd. Einwohner für E-Autos",
+                "wert_num": pro1000,
+                "score_normiert": s.get("score_s4"),
+                "erhebungsjahr": jahr,
+                "quelle": "Bundesnetzagentur Ladesäulenregister",
+                "quelle_typ": "automatisch",
+                "letzter_abruf": datetime.now(timezone.utc).isoformat(),
+            }, on_conflict="kommune_id,sicht_nr,kennzahl,erhebungsjahr").execute()
+            gepusht += 1
+            log(f"  ✓ {name}: {pro1000} Ladepunkte/1000 EW → Supabase")
+        except Exception as e:
+            log(f"  ✗ {name}: Supabase-Fehler: {e}")
+    log(f"Supabase: {gepusht}/{len(KOMMUNE_IDS)} Pilotkommunen aktualisiert")
+
+
 def main() -> None:
     global KOMMUNEN, BENCHMARK_PRO_TAUSEND
     ap = argparse.ArgumentParser(description="KommunalSpiegel Sicht 4 BNetzA Backend v6")
@@ -781,6 +840,10 @@ def main() -> None:
     out = {"schema":SCHEMA, "version":VERSION, "generated_at":datetime.now(timezone.utc).isoformat(), "source":{"name":"Bundesnetzagentur Ladesäulenregister", "api_url":source_url, "download_pages":BNETZA_PAGE_URLS, "api_status":"ok", "note":"BNetzA-Datei gelesen; Punkte werden nur bei echter Gemeindegrenze per Point-in-Polygon als Live-Wert gezählt."}, "diagnostics":diag, "statistik":{"kommunen_gesamt":len(summaries), "kommunen_api":api, "kommunen_gemischt":mix, "kommunen_benchmark":bm, "ladepunkte_api_gesamt":sum(s["ladepunkte_gesamt"] for s in summaries), "bnetza_datensaetze":len(rows), "verwertbare_ladepunkte":len(points)}, "qualitaetsregeln":{"api":"API-Zählung >=80% Benchmark → API ersetzt Benchmark", "gemischt":"40–80% → beide anzeigen", "benchmark":"<40%, Fehler oder keine Grenze → Benchmark bleibt Basis", "neu":"kein Benchmark vorhanden → API allein"}, "kommunen":summaries}
     write_json(out_path, out)
     log(f"Fertig: API={api}, gemischt={mix}, benchmark={bm}, nutzbare BNetzA-Punkte={len(points):,}")
+
+    log("-"*72)
+    log("[Supabase] Push der Sicht-4-Ergebnisse für die 3 Pilotkommunen …")
+    push_to_supabase(summaries)
 
 if __name__ == "__main__":
     main()

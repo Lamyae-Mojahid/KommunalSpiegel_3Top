@@ -39,44 +39,31 @@ async function safeFetchJson(url, timeoutMs = 8000) {
   }
 }
 
-async function fetchChargingCount(lat, lng) {
-  const envelope = `${lng - 0.15},${lat - 0.1},${lng + 0.15},${lat + 0.1}`
-  const url = 'https://services.arcgis.com/R1nXjHtFYnPdSk7c/arcgis/rest/services/Ladesaeulen/FeatureServer/0/query?' +
-    `geometry=${encodeURIComponent(envelope)}&geometryType=esriGeometryEnvelope&spatialRel=esriSpatialRelIntersects&outFields=*&returnCountOnly=true&f=json`
-  const data = await safeFetchJson(url)
-  return Number.isFinite(data.count) ? data.count : null
-}
-
 async function buildLiveData(kommune, werte) {
   const jetzt = new Date().toISOString()
   const bySicht = {}
   for (const w of werte || []) bySicht[w.sicht_nr] = w
 
-  let ladeCount = null
-  let ladeStatus = 'fallback'
-  if (kommune.lat && kommune.lng) {
-    try {
-      ladeCount = await fetchChargingCount(kommune.lat, kommune.lng)
-      ladeStatus = 'ok'
-    } catch (e) {
-      ladeStatus = 'fallback'
-    }
-  }
+  // Hinweis: Sicht 4 (Ladeinfrastruktur) wird NICHT hier live abgefragt.
+  // Die echte, genaue Zählung (Point-in-Polygon gegen die BNetzA-Liste)
+  // läuft separat über scripts/sync_sicht4.py + .github/workflows/sync_sicht4.yml
+  // und schreibt direkt eine eigene Zeile in die Tabelle 'benchmark'.
+  // Hier wird daher für alle Sichten (inkl. 4) einfach der aktuellste
+  // gespeicherte benchmark-Wert verwendet.
 
   const sichten = Array.from({ length: 8 }, (_, i) => {
     const nr = i + 1
     const w = bySicht[nr]
-    const liveValue = nr === 4 && ladeCount != null ? ladeCount : null
     return {
       sicht_nr: nr,
       name: w?.kennzahl || `Sicht ${nr}`,
-      wert: liveValue ?? w?.wert_num ?? null,
-      einheit: nr === 4 && liveValue != null ? 'Ladepunkte im Umkreis ca. 15 km' : 'Benchmark-Score / Periodenwert',
-      quelle: nr === 4 && liveValue != null ? 'Bundesnetzagentur Ladesäulenregister' : (w?.quelle || 'Benchmark-Erhebung 2024 / Fallback'),
-      quelle_url: nr === 4 ? 'https://www.bundesnetzagentur.de/ladesaeulenregister' : (w?.quelle_url || ''),
+      wert: w?.wert_num ?? null,
+      einheit: 'Benchmark-Score / Periodenwert',
+      quelle: w?.quelle || 'Benchmark-Erhebung 2024 / Fallback',
+      quelle_url: w?.quelle_url || '',
       abgerufen: jetzt,
       score: w?.score_normiert ?? null,
-      status: nr === 4 ? ladeStatus : 'fallback'
+      status: w ? 'ok' : 'fallback'
     }
   })
 
@@ -117,7 +104,7 @@ async function main() {
         .from('benchmark')
         .select('*')
         .eq('kommune_id', k.id)
-        .eq('erhebungsjahr', 2024)
+        .eq('erhebungsjahr', 2025)
       if (wErr) throw wErr
 
       const liveData = await buildLiveData(k, werte || [])
