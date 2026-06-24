@@ -1,0 +1,32 @@
+name: Sync S2 Virtuelle Touren
+
+on:
+  schedule:
+    - cron: '0 7 1 * *'   # monatlich, am 1. des Monats, 07:00 UTC
+  workflow_dispatch:
+
+jobs:
+  sync-virtuelle-touren:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Virtuelle Touren sync
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          MAPILLARY_TOKEN: ${{ secrets.MAPILLARY_TOKEN }}
+        run: |
+          python scripts/sync_sicht2_osm_pois.py --alle --mapillary-token "$MAPILLARY_TOKEN"

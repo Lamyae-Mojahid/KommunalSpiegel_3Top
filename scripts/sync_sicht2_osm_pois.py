@@ -32,8 +32,20 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import requests
 from kommunen_seed_loader import load_seed, seed_kommunen, seed_benchmark_s4, seed_benchmark_s2, seed_benchmark_s10
 
+try:
+    from supabase import create_client
+except ImportError:
+    create_client = None
+
 VERSION = "7.6.0"
 SCHEMA = "kommunalspiegel.sicht2_virtuelle_touren.v7_6_top3_overpassfix"
+
+# ── Supabase: feste kommune_id-Zuordnung für die 3 Pilotkommunen ────
+KOMMUNE_IDS = {
+    "Leuna": 1,
+    "Querfurt": 2,
+    "Bad Dürrenberg": 3,
+}
 USER_AGENT = "KommunalSpiegel/7.4 Hochschulprojekt Sicht2 VirtuelleTouren"
 TIMEOUT = 25
 DATA_DIR = Path("data")
@@ -579,6 +591,86 @@ def build_result(kommune: Dict[str, Any], candidates: List[Candidate], boundary_
     }
 
 
+def push_to_supabase(results: List[Dict[str, Any]]) -> None:
+    """Schreibt die Sicht-2-Ergebnisse für die 3 Pilotkommunen nach Supabase:
+    - 'benchmark': verifizierte Touren pro 1000 EW (quelle_typ='automatisch')
+    - 'touren_punkte': jeder einzelne Kandidat/verifizierte Standort, für die Karte
+    Bestehende manuelle Zeilen bleiben unverändert.
+    """
+    url = os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL")
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_SERVICE_KEY")
+    if not url or not key:
+        log("Supabase nicht konfiguriert (SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY fehlen) — kein Push.")
+        return
+    if create_client is None:
+        log("Python-Paket 'supabase' nicht installiert — kein Push. (pip install supabase)")
+        return
+
+    sb = create_client(url, key)
+    jahr = datetime.now().year
+
+    for res in results:
+        name = res.get("kommune")
+        kommune_id = KOMMUNE_IDS.get(name)
+        if kommune_id is None:
+            continue  # nicht eine unserer 3 Pilotkommunen
+
+        per1000 = res.get("api_pois_pro_1000_ew")
+        if per1000 is None:
+            log(f"  ⚠ {name}: kein Live-Wert (Status={res.get('status')}) — überspringe Benchmark-Push")
+        else:
+            try:
+                sb.table("benchmark").upsert({
+                    "kommune_id": kommune_id,
+                    "sicht_nr": 2,
+                    "kennzahl": "Anzahl Touren pro Tsd. Einwohner",
+                    "wert_num": per1000,
+                    "score_normiert": None,
+                    "erhebungsjahr": jahr,
+                    "quelle": "OpenStreetMap Overpass API + Mapillary (≥3 Aufnahmen je Standort)",
+                    "quelle_typ": "automatisch",
+                    "letzter_abruf": datetime.now(timezone.utc).isoformat(),
+                }, on_conflict="kommune_id,sicht_nr,kennzahl,erhebungsjahr").execute()
+                log(f"  ✓ {name}: {per1000} Touren/1000 EW → Supabase")
+            except Exception as e:
+                log(f"  ✗ {name}: Supabase-Fehler (benchmark): {e}")
+
+        candidates = res.get("candidates", [])
+        try:
+            sb.table("touren_punkte").delete().eq("kommune_id", kommune_id).eq("erhebungsjahr", jahr).execute()
+        except Exception as e:
+            log(f"  ⚠ {name}: Löschen alter touren_punkte fehlgeschlagen: {e}")
+
+        if not candidates:
+            continue
+
+        rows = [{
+            "kommune_id": kommune_id,
+            "osm_type": c.get("osm_type"),
+            "osm_id": c.get("osm_id"),
+            "name": c.get("name") or None,
+            "category": c.get("category"),
+            "category_label": c.get("category_label"),
+            "lat": c.get("lat"),
+            "lng": c.get("lng"),
+            "verified": bool(c.get("verified_virtual_tour")),
+            "verification_method": c.get("verification_method"),
+            "mapillary_image_count": c.get("mapillary_image_count"),
+            "erhebungsjahr": jahr,
+        } for c in candidates]
+
+        batch_size = 500
+        gespeichert = 0
+        for i in range(0, len(rows), batch_size):
+            batch = rows[i:i + batch_size]
+            try:
+                sb.table("touren_punkte").insert(batch).execute()
+                gespeichert += len(batch)
+            except Exception as e:
+                log(f"  ✗ {name}: Fehler beim Speichern von touren_punkte (Batch {i}): {e}")
+        log(f"  {name}: {gespeichert}/{len(rows)} Tour-Kandidaten gespeichert")
+
+
 def main() -> int:
     global KOMMUNEN, BENCHMARK_PRO_TAUSEND, BENCHMARK_COUNTS
     ap = argparse.ArgumentParser(description="KommunalSpiegel Sicht 2: Virtuelle Touren mit Mindest-3-Aufnahmen-Regel")
@@ -646,6 +738,11 @@ def main() -> int:
     }
     save_json(Path(args.out), out)
     log(f"✓ geschrieben: {args.out}")
+
+    log("-"*72)
+    log("[Supabase] Push der Sicht-2-Ergebnisse für die 3 Pilotkommunen …")
+    push_to_supabase(results)
+
     return 0
 
 if __name__ == "__main__":
