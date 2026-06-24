@@ -26,12 +26,11 @@ SUPABASE_URL = os.environ['SUPABASE_URL']
 SUPABASE_KEY = os.environ['SUPABASE_SERVICE_KEY']
 GOOGLE_API_KEY = os.environ['GOOGLE_MAPS_API_KEY']
 
-# Uniquement les routes principales accessibles par voiture
-# Pas de unclassified (trop de routes rurales/agricoles)
+# Nur das städtische Straßennetz: keine Autobahn/Schnellstraße,
+# keine Rampen (*_link), kein unclassified (zu viele Feld-/Landwege).
 HIGHWAY_TYPES = {
-    'living_street', 'primary', 'primary_link', 'residential',
-    'secondary', 'secondary_link', 'tertiary', 'tertiary_link',
-    'trunk', 'trunk_link', 'motorway', 'motorway_link'
+    'living_street', 'primary', 'residential',
+    'secondary', 'tertiary'
 }
 
 PRIVATE_ACCESS = {'private', 'no', 'customers', 'permit', 'delivery', 'destination'}
