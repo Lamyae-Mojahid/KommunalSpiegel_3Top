@@ -17,6 +17,7 @@ import urllib.request
 import urllib.parse
 import subprocess
 import sys
+from typing import Dict
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
@@ -123,7 +124,8 @@ out geom;
         geom = el.get('geometry', [])
         coords = [(pt['lat'], pt['lon']) for pt in geom if 'lat' in pt and 'lon' in pt]
         if len(coords) >= 2:
-            roads.append(coords)
+            name = tags.get('name') or tags.get('name:de') or f"(unbenannt · {tags.get('highway','Weg')})"
+            roads.append({'name': name, 'coords': coords, 'highway': tags.get('highway', '')})
 
     return roads
 
@@ -152,23 +154,21 @@ def calculate_coverage(commune):
     log.info(f"{name}: {len(roads)} tronçons dans la frontière administrative")
 
     if not roads:
-        return None, []
+        return None, [], []
 
-    # Punkte PRO STRASSE interpolieren — die Reihenfolge innerhalb einer
-    # Straße bleibt erhalten, damit Segmente später nur entlang derselben
-    # Straße gebildet werden (nicht quer über mehrere Straßen hinweg).
-    roads_points = [interpolate_points(road, SAMPLE_INTERVAL) for road in roads]
-    roads_points = [pts for pts in roads_points if len(pts) >= 1]
+    # Punkte PRO STRASSE interpolieren — Name und Reihenfolge bleiben erhalten,
+    # damit Segmente nur entlang derselben Straße gebildet werden.
+    roads_with_points = []
+    for road in roads:
+        pts = interpolate_points(road['coords'], SAMPLE_INTERVAL)
+        if pts:
+            roads_with_points.append({'name': road['name'], 'highway': road['highway'], 'points': pts})
 
-    if not roads_points:
-        return None, []
+    if not roads_with_points:
+        return None, [], []
 
-    # Abdeckungsprüfung bleibt global dedupliziert (gleicher Punkt taucht
-    # manchmal auf mehreren Straßen auf — nicht doppelt bei Google abfragen).
-    # Wichtig: NUR für die Coverage-Prüfung dedupliziert, NICHT für den
-    # Segmentaufbau — die Straßenreihenfolge bleibt unten unverändert.
     coverage_cache: dict = {}
-    total_unique_points = len(set((round(p[0], 4), round(p[1], 4)) for pts in roads_points for p in pts))
+    total_unique_points = len(set((round(p[0], 4), round(p[1], 4)) for r in roads_with_points for p in r['points']))
     checked = 0
 
     def is_covered(lat, lng):
@@ -186,25 +186,49 @@ def calculate_coverage(commune):
         return result
 
     segments = []
-    for pts in roads_points:
+    # Pro Straßenname aufsummierte Länge (m), getrennt nach abgedeckt/nicht.
+    # Mehrere OSM-Way-Abschnitte mit demselben Namen werden zusammengefasst
+    # (z. B. eine lange Straße, die in mehrere OSM-Ways aufgeteilt ist).
+    road_lengths: Dict[str, Dict[str, float]] = {}
+
+    for r in roads_with_points:
+        pts = r['points']
         covered_flags = [is_covered(lat, lng) for lat, lng in pts]
+        entry = road_lengths.setdefault(r['name'], {'covered_m': 0.0, 'uncovered_m': 0.0, 'highway': r['highway']})
         for i in range(len(pts) - 1):
             lat1, lng1 = pts[i]
             lat2, lng2 = pts[i + 1]
+            seg_covered = covered_flags[i] or covered_flags[i + 1]
+            seg_len_m = haversine(lat1, lng1, lat2, lng2)
             segments.append({
                 'lat_start': round(lat1, 6), 'lng_start': round(lng1, 6),
                 'lat_end': round(lat2, 6), 'lng_end': round(lng2, 6),
-                'covered': covered_flags[i] or covered_flags[i + 1],
+                'covered': seg_covered,
             })
+            if seg_covered:
+                entry['covered_m'] += seg_len_m
+            else:
+                entry['uncovered_m'] += seg_len_m
+
+    roads_summary = [
+        {
+            'strassenname': rname,
+            'highway': info['highway'],
+            'laenge_abgedeckt_m': round(info['covered_m'], 1),
+            'laenge_nicht_abgedeckt_m': round(info['uncovered_m'], 1),
+            'laenge_gesamt_m': round(info['covered_m'] + info['uncovered_m'], 1),
+        }
+        for rname, info in road_lengths.items()
+    ]
 
     total = len(coverage_cache)
     covered_count = sum(1 for v in coverage_cache.values() if v)
     pct = round((covered_count / total) * 100, 2) if total else 0.0
     score = min(10.0, max(0.0, round(pct / 10, 1)))
     log.info(f"{name}: {covered_count}/{total} → {pct}% (score: {score})")
-    return {'pct': pct, 'score': score, 'total_points': total, 'covered_points': covered_count}, segments
+    return {'pct': pct, 'score': score, 'total_points': total, 'covered_points': covered_count}, segments, roads_summary
 
-def update_supabase(supabase, commune, result, segments):
+def update_supabase(supabase, commune, result, segments, roads_summary):
     commune_name = commune['name']
     kommune_id = commune['kommune_id']
     try:
@@ -230,6 +254,21 @@ def update_supabase(supabase, commune, result, segments):
                 'covered': s['covered'], 'erhebungsjahr': 2026,
             } for s in batch]).execute()
             log.info(f"{commune_name}: {min(i+500, len(segments))}/{len(segments)} segments sauvegardés")
+
+        # Tabelle 1/2 der Spezifikation: Straßenname + Länge (m), abgedeckt/nicht.
+        supabase.table('streetview_roads_summary').delete().eq('kommune_id', kommune_id).eq('erhebungsjahr', 2026).execute()
+        for i in range(0, len(roads_summary), 500):
+            batch = roads_summary[i:i+500]
+            supabase.table('streetview_roads_summary').insert([{
+                'kommune_id': kommune_id,
+                'strassenname': r['strassenname'],
+                'highway_typ': r['highway'],
+                'laenge_abgedeckt_m': r['laenge_abgedeckt_m'],
+                'laenge_nicht_abgedeckt_m': r['laenge_nicht_abgedeckt_m'],
+                'laenge_gesamt_m': r['laenge_gesamt_m'],
+                'erhebungsjahr': 2026,
+            } for r in batch]).execute()
+        log.info(f"{commune_name}: {len(roads_summary)} Straßen-Zusammenfassungen gespeichert")
 
         log.info(f"{commune_name}: ✅ → {result['pct']}%")
         return True
@@ -261,9 +300,9 @@ def main():
             log.info(f"{name}: déjà traité ✅ — skip")
             continue
         try:
-            result, segments = calculate_coverage(commune)
+            result, segments, roads_summary = calculate_coverage(commune)
             if result:
-                update_supabase(supabase, commune, result, segments)
+                update_supabase(supabase, commune, result, segments, roads_summary)
                 results[name] = result
         except Exception as e:
             log.error(f"{name}: {e}")
