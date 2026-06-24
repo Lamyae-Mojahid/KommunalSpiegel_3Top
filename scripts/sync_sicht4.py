@@ -135,6 +135,7 @@ class Ladepunkt:
     anschlussleistung_kw: Optional[float]
     steckertypen: str
     inbetriebnahme: str
+    ladeeinrichtungs_id: str = ""
     quelle: str = "BNetzA Ladesäulenregister"
 
 
@@ -442,6 +443,7 @@ def normalize_ladepunkte(rows: List[Dict[str, Any]], meta: Dict[str, Any], debug
         "stecker": ["Steckertypen", "Steckertyp", "Anschluss", "Anschlusstyp", "Stecker"],
         "inbetrieb": ["Inbetriebnahmedatum", "Inbetriebnahme", "Datum der Inbetriebnahme"],
         "name": ["Ladeeinrichtung", "Standortbezeichnung", "Name", "Bezeichnung", "Ladesäule"],
+        "le_id": ["Ladeeinrichtungs-ID", "Ladeeinrichtungs ID", "LadeeinrichtungsID", "ID"],
     }
     out: List[Ladepunkt] = []
     no_coord=0; outside=0; swapped_count=0
@@ -459,6 +461,7 @@ def normalize_ladepunkte(rows: List[Dict[str, Any]], meta: Dict[str, Any], debug
         plz = get_val(r, cols, aliases["plz"])
         ort = get_val(r, cols, aliases["ort"])
         name = get_val(r, cols, aliases["name"]) or betreiber or "Ladeeinrichtung"
+        le_id = get_val(r, cols, aliases["le_id"])
         leistung = parse_float_de(get_val(r, cols, aliases["leistung"]))
         anschluss = parse_float_de(get_val(r, cols, aliases["anschluss"]))
         stecker = get_val(r, cols, aliases["stecker"])
@@ -467,7 +470,7 @@ def normalize_ladepunkte(rows: List[Dict[str, Any]], meta: Dict[str, Any], debug
         anzahl = max(1, int(round(anz_raw))) if anz_raw is not None else 1
         art = "DC" if (leistung is not None and leistung >= 50) or re.search(r"\b(CCS|CHAdeMO|DC|HPC)\b", stecker or "", re.I) else "AC"
         adresse = " ".join(x for x in [strasse, hausnr] if x).strip()
-        out.append(Ladepunkt(name=name, betreiber=betreiber, adresse=adresse, plz=plz, ort=ort, lat=round(lat, 7), lng=round(lng, 7), anzahl=anzahl, art=art, leistung_kw=leistung, anschlussleistung_kw=anschluss, steckertypen=stecker, inbetriebnahme=inbetrieb))
+        out.append(Ladepunkt(name=name, betreiber=betreiber, adresse=adresse, plz=plz, ort=ort, lat=round(lat, 7), lng=round(lng, 7), anzahl=anzahl, art=art, leistung_kw=leistung, anschlussleistung_kw=anschluss, steckertypen=stecker, inbetriebnahme=inbetrieb, ladeeinrichtungs_id=le_id))
     diag = {
         **meta,
         "columns": cols,
@@ -685,30 +688,13 @@ def quality_status(total_lp: int, benchmark_pro_1000: Optional[float], ew: int, 
     return "benchmark", round(ratio, 3), f"API deutlich unter Benchmark ({ratio:.0%}); Benchmark bleibt Basis"
 
 
-def dedupe_ladepunkte(points: List["Ladepunkt"]) -> List["Ladepunkt"]:
-    """Entfernt exakte Duplikate: gleiche Adresse + gleiche Koordinaten (auf
-    5 Nachkommastellen gerundet, ~1m Genauigkeit) + gleicher Betreiber.
-    Punkte mit leicht unterschiedlichen Koordinaten (z. B. mehrere Ladepunkte
-    auf einem großen Parkplatz) bleiben bewusst erhalten — das sind echte,
-    separate physische Standorte.
-    """
-    seen: Dict[Tuple[str, str, float, float], "Ladepunkt"] = {}
-    for p in points:
-        key = (norm_key(p.betreiber), norm_key(p.adresse), round(p.lat, 5), round(p.lng, 5))
-        if key not in seen:
-            seen[key] = p
-        # bei echtem Duplikat: erstes Vorkommen behalten, Rest verwerfen
-    return list(seen.values())
-
-
 def aggregate(k: Dict[str, Any], all_points: List[Ladepunkt], boundary: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     bm = BENCHMARK_PRO_TAUSEND.get(k["name"])
     ew = int(k.get("ew") or 0)
     selected: List[Ladepunkt] = []
     if boundary:
         candidates = [p for p in all_points if in_bbox(p, boundary["bbox"])]
-        matched = [p for p in candidates if point_in_geom(p, boundary["geometry"])]
-        selected = dedupe_ladepunkte(matched)
+        selected = [p for p in candidates if point_in_geom(p, boundary["geometry"])]
     total = sum(p.anzahl for p in selected)
     dc = sum(p.anzahl for p in selected if p.art == "DC")
     ac = max(0, total - dc)
@@ -780,6 +766,7 @@ def push_ladesaeulen_to_supabase(sb, kommune_id: int, name: str, ladepunkte: Lis
 
     rows = [{
         "kommune_id": kommune_id,
+        "ladeeinrichtungs_id": p.ladeeinrichtungs_id or None,
         "betreiber": p.betreiber or None,
         "adresse": p.adresse or None,
         "plz": p.plz or None,
