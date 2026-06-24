@@ -2292,6 +2292,65 @@ function Sicht4LiveLadeMap({ kommune, benchmarkValue, score }) {
   );
 }
 
+/* Sicht 6 · amtliche WMS-Karte (BNetzA Mobilfunk-Monitor, gehostet vom BKG).
+   Layer-Namen bestaetigt via GetCapabilities: gsm (2G) / lte (4G) / 5g (5G).
+   Reine Bild-Kachel-Ueberlagerung -- kein Scraping, nur WMS GetMap-Anfragen. */
+function MobilfunkWmsMap({ lat, lng, kommune }) {
+  const mapElRef = React.useRef(null);
+  const mapObjRef = React.useRef(null);
+  const wmsLayerRef = React.useRef(null);
+  const [tech, setTech] = React.useState('lte');
+
+  const WMS_BASE = 'https://sgx.geodatenzentrum.de/wms_bnetza_mobilfunk';
+  const WMS_LAYERS = { '2G': 'gsm', '4G': 'lte', '5G': '5g' };
+
+  React.useEffect(() => {
+    if (!mapElRef.current || !window.L) return;
+    if (mapObjRef.current) { try { mapObjRef.current.remove(); } catch(e){} mapObjRef.current = null; }
+    const m = L.map(mapElRef.current, { zoomControl: true }).setView([lat, lng], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap', maxZoom: 18 }).addTo(m);
+    const wms = L.tileLayer.wms(WMS_BASE, {
+      layers: WMS_LAYERS[tech.toUpperCase()] || 'lte',
+      format: 'image/png', transparent: true, version: '1.3.0',
+      attribution: '© Bundesnetzagentur (Mobilfunk-Monitoring)',
+    }).addTo(m);
+    wmsLayerRef.current = wms;
+    mapObjRef.current = m;
+    return () => { try { m.remove(); } catch(e){} mapObjRef.current = null; };
+  }, [lat, lng]);
+
+  React.useEffect(() => {
+    if (!mapObjRef.current || !window.L) return;
+    if (wmsLayerRef.current) { try { mapObjRef.current.removeLayer(wmsLayerRef.current); } catch(e){} }
+    const wms = L.tileLayer.wms(WMS_BASE, {
+      layers: WMS_LAYERS[tech.toUpperCase()] || 'lte',
+      format: 'image/png', transparent: true, version: '1.3.0',
+      attribution: '© Bundesnetzagentur (Mobilfunk-Monitoring)',
+    }).addTo(mapObjRef.current);
+    wmsLayerRef.current = wms;
+  }, [tech]);
+
+  return (
+    <div>
+      <div style={{display:'flex',gap:8,marginBottom:8,alignItems:'center'}}>
+        <span style={{fontSize:11,fontWeight:700,color:'var(--ink-3)'}}>Technologie:</span>
+        {['2G','4G','5G'].map(t => (
+          <button key={t} onClick={() => setTech(t)} style={{
+            padding:'4px 12px', fontSize:11, fontWeight:700, borderRadius:'var(--r)',
+            border: tech.toUpperCase()===t ? '2px solid var(--primary)' : '1px solid var(--line)',
+            background: tech.toUpperCase()===t ? 'var(--primary)' : 'var(--surface)',
+            color: tech.toUpperCase()===t ? '#FFF' : 'var(--ink-3)',
+            cursor:'pointer',
+          }}>{t}</button>
+        ))}
+        <span style={{fontSize:10,color:'var(--ink-4)'}}>© Bundesnetzagentur · amtliches Mobilfunk-Monitoring (anbieterneutral)</span>
+      </div>
+      <div ref={mapElRef} style={{width:'100%',height:340,borderRadius:'var(--r)',overflow:'hidden',border:'1px solid var(--line)'}}></div>
+    </div>
+  );
+}
+
+
 function SichtDetailView({ sichtNr, kommune, setTab }) {
   const [activeKommune, setActiveKommune] = useState(kommune || 'Leuna');
   const [viewMode, setViewMode] = useState('karte'); // 'karte' | 'tabelle' | 'verteilung'
@@ -2401,6 +2460,53 @@ function SichtDetailView({ sichtNr, kommune, setTab }) {
           <div className="kpi-trend" style={{color:'var(--ink-4)',fontSize:11}}>von 33 Kommunen</div>
         </div>
       </div>
+
+      {/* Sicht 6 · Mobilfunk je Anbieter (CellMapper) + Legende + amtliche WMS-Karte */}
+      {isMobilfunk && (() => {
+        const MF_GEO = { 'Leuna': [51.3286, 12.0032], 'Querfurt': [51.3803, 11.5897], 'Bad Dürrenberg': [51.2965, 12.0645] };
+        const [lat, lng] = MF_GEO[activeKommune] || [51.34, 11.97];
+        const cm = (mnc) => `https://www.cellmapper.net/map?MCC=262&MNC=${mnc}&type=LTE&latitude=${lat}&longitude=${lng}&zoom=14&showTowers=true&showIcons=true&clusterEnabled=true&tilesEnabled=true&mapType=roadmap`;
+        const anbieter = [
+          { name: 'Telekom', mnc: 1, color: '#E20074' },
+          { name: 'Vodafone', mnc: 2, color: '#E60000' },
+          { name: 'O2 / Telef\u00f3nica', mnc: 3, color: '#0019A5' },
+        ];
+        const klassen = [
+          { label: 'Stark', dbm: '\u221240 bis \u221295 dBm', color: '#349a2c' },
+          { label: 'Gut/mittel', dbm: '\u221296 bis \u2212115 dBm', color: '#344a2c' },
+          { label: 'Schwach', dbm: '\u2212116 bis \u2212140 dBm', color: '#e31a1c' },
+          { label: 'Keine Angabe', dbm: '\u2014', color: '#ffffff' },
+        ];
+        return (
+          <div className="card card-pad" style={{marginBottom:18}}>
+            <div className="card-head">
+              <div className="card-title">Mobilfunk-Abdeckung je Anbieter \u00b7 {activeKommune}</div>
+              <span className="text-xs text-faint">Amtliche Karte (BNetzA) \u00b7 Live-Detail via CellMapper</span>
+            </div>
+            <p style={{fontSize:12,color:'var(--ink-4)',margin:'0 0 12px',lineHeight:1.6}}>
+              Die automatische Kennzahl stammt aus dem amtlichen BNetzA Mobilfunk-Monitoring (je 100-m-Zelle, beste verf\u00fcgbare Technologie). F\u00fcr die anbieterscharfe Ansicht in dBm \u2013 wie auf dem Poster \u2013 \u00f6ffnen die Buttons CellMapper, zentriert auf {activeKommune}, getrennt nach Netzbetreiber:
+            </p>
+            <div style={{display:'flex',gap:10,flexWrap:'wrap',marginBottom:16}}>
+              {anbieter.map(a => (
+                <a key={a.mnc} href={cm(a.mnc)} target="_blank" rel="noopener noreferrer"
+                   style={{display:'inline-flex',alignItems:'center',gap:8,padding:'8px 14px',borderRadius:'var(--r)',border:`2px solid ${a.color}`,color:a.color,fontWeight:700,fontSize:13,textDecoration:'none',background:'var(--surface)'}}>
+                  <span style={{width:10,height:10,borderRadius:'50%',background:a.color}}></span>{a.name} \u2197
+                </a>
+              ))}
+            </div>
+            <MobilfunkWmsMap lat={lat} lng={lng} kommune={activeKommune} />
+            <div style={{display:'flex',gap:14,flexWrap:'wrap',alignItems:'center',marginTop:14}}>
+              <span style={{fontSize:11,fontWeight:700,color:'var(--ink-3)'}}>Legende:</span>
+              {klassen.map(k => (
+                <span key={k.label} style={{display:'inline-flex',alignItems:'center',gap:6,fontSize:11,color:'var(--ink-3)'}}>
+                  <span style={{width:14,height:14,borderRadius:3,background:k.color,border:'1px solid var(--line)'}}></span>
+                  {k.label} <span style={{color:'var(--ink-4)'}}>{k.dbm}</span>
+                </span>
+              ))}
+            </div>
+          </div>
+        );
+      })()}
 
       {/* View Mode Tabs */}
       <div style={{display:'flex',gap:6,marginBottom:16}}>

@@ -1,0 +1,437 @@
+"""
+sync_sicht6_mobilfunk.py - KommunalSpiegel Sicht 6
+Mobilfunkabdeckung, automatisiert über das amtliche BNetzA Mobilfunk-Monitoring
+(WMS-Dienst, gehostet vom BKG: https://sgx.geodatenzentrum.de/wms_bnetza_mobilfunk).
+
+Methode (Analog zum Poster, aber automatisiert statt cellmapper-Handauswertung):
+1. 500-m-Raster über die echte Gemeindegrenze legen (wie beim Poster: ein
+   Messpunkt je Quadrat, hier: Zentrum jedes Rasterquadrats).
+2. Für jeden Punkt per WMS GetFeatureInfo (1x1-Pixel-Anfrage) abfragen, ob die
+   Zelle in der jeweiligen Technologie (5G / 4G / 2G) abgedeckt ist.
+3. Je Punkt die beste verfügbare Technologie nehmen → eine der 4 Klassen
+   (Stark/Gut-mittel/Schwach/Keine Angabe), exakt wie auf dem Poster.
+4. Kennzahl = Mittelwert über alle Messpunkte (Anteil der Fläche je Klasse,
+   bzw. % der Fläche mit ≥4G).
+
+Ehrlicher Hinweis (gehört in die Erläuterungen/Beobachtungen):
+Die amtliche Quelle liefert "abgedeckt/nicht abgedeckt" je Technologie und ist
+anbieterneutral (sie sagt nicht WELCHER Betreiber). Echte dBm-Werte je
+Netzbetreiber – wie im Poster per cellmapper händisch erhoben – sind über keine
+offizielle, automatisierbare Schnittstelle verfügbar; dafür verlinkt das
+Dashboard direkt auf cellmapper je Betreiber (siehe index.html Sicht 6).
+"""
+
+import os
+import sys
+import time
+import json
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+log = logging.getLogger(__name__)
+
+SUPABASE_URL = os.environ.get('SUPABASE_URL', '')
+SUPABASE_KEY = os.environ.get('SUPABASE_SERVICE_ROLE_KEY', '') or os.environ.get('SUPABASE_SERVICE_KEY', '')
+
+WMS_BASE = 'https://sgx.geodatenzentrum.de/wms_bnetza_mobilfunk'
+WMS_LAYERS = {'2G': 'gsm', '4G': 'lte', '5G': '5g'}
+GRID_STEP_M = 500.0
+USER_AGENT = 'KommunalSpiegel-Hochschule-Merseburg/1.0'
+TIMEOUT = 30
+NOMINATIM_DELAY = 1.1
+
+GEO_CACHE = Path(__file__).parent / 'data' / 'cache' / 'geo_boundaries_sicht6.json'
+
+COMMUNES = [
+    {'name': 'Leuna',          'kommune_id': 1, 'ags': '15083090', 'lat': 51.3286, 'lng': 12.0032, 'lk': 'Saalekreis'},
+    {'name': 'Querfurt',       'kommune_id': 2, 'ags': '15083260', 'lat': 51.3803, 'lng': 11.5897, 'lk': 'Saalekreis'},
+    {'name': 'Bad Dürrenberg', 'kommune_id': 3, 'ags': '15083020', 'lat': 51.2965, 'lng': 12.0645, 'lk': 'Saalekreis'},
+]
+
+KLASSEN = [
+    {'label': 'Stark',        'dbm': '−40 bis −95 dBm',   'color': '#349a2c', 'min_tech': '5G'},
+    {'label': 'Gut/mittel',   'dbm': '−96 bis −115 dBm',  'color': '#344a2c', 'min_tech': '4G'},
+    {'label': 'Schwach',      'dbm': '−116 bis −140 dBm', 'color': '#e31a1c', 'min_tech': '2G'},
+    {'label': 'Keine Angabe', 'dbm': '—',                 'color': '#ffffff', 'min_tech': None},
+]
+
+
+def log_step(msg: str) -> None:
+    log.info(msg)
+
+
+# ── Gemeindegrenze laden (wiederverwendete, bewährte Logik aus sync_sicht4.py) ──
+
+def normalize_geojson(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not obj:
+        return None
+    if obj.get('type') == 'FeatureCollection':
+        feats = obj.get('features') or []
+        if feats:
+            return normalize_geojson(feats[0])
+    if obj.get('type') == 'Feature':
+        return normalize_geojson(obj.get('geometry'))
+    if obj.get('type') in {'Polygon', 'MultiPolygon'}:
+        return {'type': obj['type'], 'coordinates': obj['coordinates']}
+    return None
+
+
+def geom_bbox(geom: Dict[str, Any]) -> List[float]:
+    xs, ys = [], []
+    def walk(c):
+        if isinstance(c, list) and c and isinstance(c[0], (int, float)):
+            xs.append(float(c[0])); ys.append(float(c[1]))
+        elif isinstance(c, list):
+            for x in c:
+                walk(x)
+    walk(geom.get('coordinates', []))
+    return [min(xs), min(ys), max(xs), max(ys)] if xs and ys else [0, 0, 0, 0]
+
+
+def bbox_contains(bbox: List[float], lng: float, lat: float, pad: float = 0.0) -> bool:
+    w, s, e, n = bbox
+    return w - pad <= lng <= e + pad and s - pad <= lat <= n + pad
+
+
+def point_in_ring(lng: float, lat: float, ring: List[List[float]]) -> bool:
+    inside = False
+    j = len(ring) - 1
+    for i in range(len(ring)):
+        xi, yi = ring[i][0], ring[i][1]
+        xj, yj = ring[j][0], ring[j][1]
+        if (yi > lat) != (yj > lat):
+            xint = (xj - xi) * (lat - yi) / ((yj - yi) or 1e-12) + xi
+            if lng < xint:
+                inside = not inside
+        j = i
+    return inside
+
+
+def point_in_polygon(lng: float, lat: float, poly: List[Any]) -> bool:
+    return bool(poly) and point_in_ring(lng, lat, poly[0]) and not any(point_in_ring(lng, lat, h) for h in poly[1:])
+
+
+def point_in_geom(lng: float, lat: float, geo: Dict[str, Any]) -> bool:
+    if geo['type'] == 'Polygon':
+        return point_in_polygon(lng, lat, geo['coordinates'])
+    return any(point_in_polygon(lng, lat, poly) for poly in geo['coordinates'])
+
+
+def load_geo_cache() -> Dict[str, Any]:
+    if GEO_CACHE.exists():
+        try:
+            return json.loads(GEO_CACHE.read_text(encoding='utf-8'))
+        except Exception:
+            return {}
+    return {}
+
+
+def save_geo_cache(cache: Dict[str, Any]) -> None:
+    GEO_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    GEO_CACHE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding='utf-8')
+
+
+def fetch_boundary_overpass_ags(ags: str) -> Optional[Dict[str, Any]]:
+    if not ags:
+        return None
+    q = f'''[out:json][timeout:60];
+relation["boundary"="administrative"]["admin_level"="8"]["de:amtlicher_gemeindeschluessel"="{ags}"];
+out tags;'''
+    r = requests.post('https://overpass-api.de/api/interpreter', data={'data': q}, headers={'User-Agent': USER_AGENT}, timeout=TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    rels = [e for e in data.get('elements', []) if e.get('type') == 'relation' and e.get('id')]
+    if not rels:
+        return None
+    rel_id = rels[0]['id']
+    time.sleep(NOMINATIM_DELAY)
+    lookup = requests.get('https://nominatim.openstreetmap.org/lookup',
+                           params={'format': 'jsonv2', 'polygon_geojson': 1, 'osm_ids': f'R{rel_id}'},
+                           headers={'User-Agent': USER_AGENT}, timeout=TIMEOUT)
+    lookup.raise_for_status()
+    items = lookup.json()
+    if not items:
+        return None
+    geo = normalize_geojson(items[0].get('geojson'))
+    if not geo:
+        return None
+    return {'geometry': geo, 'bbox': geom_bbox(geo), 'source': 'OSM Relation via Overpass AGS + Nominatim',
+            'display_name': items[0].get('display_name')}
+
+
+def fetch_boundary_nominatim(k: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    queries = []
+    if k.get('ags'):
+        queries.append(k['ags'])
+    queries += [f'{k["name"]}, {k.get("lk", "")}, Sachsen-Anhalt, Deutschland',
+                f'Stadt {k["name"]}, Sachsen-Anhalt, Deutschland', f'{k["name"]}, Sachsen-Anhalt']
+    for q in queries:
+        r = requests.get('https://nominatim.openstreetmap.org/search',
+                          params={'format': 'jsonv2', 'polygon_geojson': 1, 'addressdetails': 1, 'limit': 10, 'q': q, 'countrycodes': 'de'},
+                          headers={'User-Agent': USER_AGENT}, timeout=TIMEOUT)
+        r.raise_for_status()
+        items = r.json()
+        for item in items:
+            addr = item.get('address') or {}
+            if addr.get('country_code') != 'de':
+                continue
+            geo = normalize_geojson(item.get('geojson'))
+            if not geo:
+                continue
+            bb = geom_bbox(geo)
+            if bbox_contains(bb, k['lng'], k['lat'], pad=0.02):
+                return {'geometry': geo, 'bbox': bb, 'source': 'Nominatim OSM Polygon', 'display_name': item.get('display_name')}
+        time.sleep(NOMINATIM_DELAY)
+    return None
+
+
+def fetch_boundary(k: Dict[str, Any], cache: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    key = f'{k["name"]}|{k.get("ags", "")}'
+    if key in cache and cache[key]:
+        return cache[key]
+    log_step(f"{k['name']}: Gemeindegrenze laden …")
+    try:
+        res = fetch_boundary_overpass_ags(k.get('ags')) if k.get('ags') else None
+        if res and bbox_contains(res['bbox'], k['lng'], k['lat'], pad=0.02):
+            cache[key] = res; save_geo_cache(cache)
+            log_step(f"  ✓ Grenze via AGS/OSM: {res.get('display_name')}")
+            return res
+    except Exception as e:
+        log_step(f"  WARN Overpass/AGS: {e}")
+    try:
+        res = fetch_boundary_nominatim(k)
+        if res:
+            cache[key] = res; save_geo_cache(cache)
+            log_step(f"  ✓ Grenze via Nominatim: {res.get('display_name')}")
+            return res
+    except Exception as e:
+        log_step(f"  WARN Nominatim: {e}")
+    cache[key] = None; save_geo_cache(cache)
+    log_step('  ✗ keine belastbare Gemeindegrenze')
+    return None
+
+
+# ── 500-m-Raster erzeugen (innerhalb der echten Gemeindegrenze) ──
+
+def lonlat_to_webmercator(lng: float, lat: float) -> Tuple[float, float]:
+    import math
+    R = 6378137.0
+    x = R * math.radians(lng)
+    y = R * math.log(math.tan(math.pi / 4 + math.radians(lat) / 2))
+    return x, y
+
+
+def webmercator_to_lonlat(x: float, y: float) -> Tuple[float, float]:
+    import math
+    R = 6378137.0
+    lng = math.degrees(x / R)
+    lat = math.degrees(2 * math.atan(math.exp(y / R)) - math.pi / 2)
+    return lng, lat
+
+
+def build_grid(boundary: Dict[str, Any], step_m: float = GRID_STEP_M) -> List[Tuple[float, float]]:
+    """Erzeugt Rasterpunkte (lat, lng) im 500-m-Abstand, deren Zentren innerhalb
+    der echten Gemeindegrenze liegen (Punkt-in-Polygon-Test je Quadratzentrum)."""
+    w, s, e, n = boundary['bbox']
+    x0, y0 = lonlat_to_webmercator(w, s)
+    x1, y1 = lonlat_to_webmercator(e, n)
+
+    points = []
+    y = y0 + step_m / 2
+    while y < y1:
+        x = x0 + step_m / 2
+        while x < x1:
+            lng, lat = webmercator_to_lonlat(x, y)
+            if point_in_geom(lng, lat, boundary['geometry']):
+                points.append((lat, lng))
+            x += step_m
+        y += step_m
+    return points
+
+
+# ── WMS GetFeatureInfo: Abdeckung je Technologie an einem Punkt prüfen ──
+
+def query_wms_coverage(lat: float, lng: float, layer: str) -> bool:
+    """Fragt den BNetzA-WMS via GetFeatureInfo ab, ob am angegebenen Punkt eine
+    Abdeckung für die gegebene Technologie-Schicht (gsm/lte/5g) vorhanden ist.
+    1x1-Pixel-Bildanfrage exakt zentriert auf den Punkt, um Pixel-Rundung zu
+    vermeiden. WMS 1.3.0 nutzt I/J (nicht X/Y) für die Pixel-Koordinaten."""
+    x, y = lonlat_to_webmercator(lng, lat)
+    d = 1.0  # Mini-BBOX von 2m x 2m um den Punkt (Web Mercator, Meter)
+    params = {
+        'SERVICE': 'WMS', 'VERSION': '1.3.0', 'REQUEST': 'GetFeatureInfo',
+        'LAYERS': layer, 'QUERY_LAYERS': layer,
+        'CRS': 'EPSG:3857', 'BBOX': f'{x-d},{y-d},{x+d},{y+d}',
+        'WIDTH': 1, 'HEIGHT': 1, 'I': 0, 'J': 0,
+        'INFO_FORMAT': 'application/json', 'FEATURE_COUNT': 1,
+    }
+    try:
+        r = requests.get(WMS_BASE, params=params, headers={'User-Agent': USER_AGENT}, timeout=TIMEOUT)
+        if r.status_code != 200:
+            return False
+        ctype = r.headers.get('Content-Type', '')
+        if 'json' in ctype:
+            data = r.json()
+            return bool(data.get('features'))
+        # Fallback: manche Server liefern GML/XML statt JSON; grobe Heuristik
+        text = r.text.strip()
+        return bool(text) and '<gml' in text.lower() and 'featureMember' in text
+    except Exception:
+        return False
+
+
+def best_technology(lat: float, lng: float) -> Optional[str]:
+    """Prüft 5G zuerst, dann 4G, dann 2G — gibt die beste verfügbare Technologie
+    zurück (oder None, wenn keine Abdeckung gefunden wurde)."""
+    for tech in ('5G', '4G', '2G'):
+        if query_wms_coverage(lat, lng, WMS_LAYERS[tech]):
+            return tech
+    return None
+
+
+def klass_for_tech(tech: Optional[str]) -> Dict[str, Any]:
+    if tech == '5G':
+        return KLASSEN[0]
+    if tech == '4G':
+        return KLASSEN[1]
+    if tech == '2G':
+        return KLASSEN[2]
+    return KLASSEN[3]
+
+
+# ── Hauptablauf je Kommune ──
+
+def process_commune(k: Dict[str, Any], cache: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    name = k['name']
+    boundary = fetch_boundary(k, cache)
+    if not boundary:
+        log_step(f"{name}: keine Gemeindegrenze — überspringe")
+        return None
+
+    grid = build_grid(boundary)
+    log_step(f"{name}: {len(grid)} Rasterpunkte (500 m) innerhalb der Gemeindegrenze")
+    if not grid:
+        return None
+
+    results = []
+    for i, (lat, lng) in enumerate(grid):
+        tech = best_technology(lat, lng)
+        results.append({'lat': lat, 'lng': lng, 'tech': tech, 'klasse': klass_for_tech(tech)['label']})
+        if (i + 1) % 10 == 0:
+            log_step(f"{name}: {i+1}/{len(grid)} Punkte geprüft")
+        time.sleep(0.15)  # WMS schonen
+
+    total = len(results)
+    n_5g = sum(1 for r in results if r['tech'] == '5G')
+    n_4g_or_better = sum(1 for r in results if r['tech'] in ('5G', '4G'))
+    n_2g_or_better = sum(1 for r in results if r['tech'] in ('5G', '4G', '2G'))
+    n_keine = sum(1 for r in results if r['tech'] is None)
+
+    pct_5g = round(n_5g / total * 100, 1) if total else 0.0
+    pct_4g_plus = round(n_4g_or_better / total * 100, 1) if total else 0.0
+    pct_2g_plus = round(n_2g_or_better / total * 100, 1) if total else 0.0
+    pct_keine = round(n_keine / total * 100, 1) if total else 0.0
+
+    log_step(f"{name}: 5G={pct_5g}% · ≥4G={pct_4g_plus}% · ≥2G={pct_2g_plus}% · keine Angabe={pct_keine}%")
+
+    return {
+        'kommune': name, 'kommune_id': k['kommune_id'], 'punkte': results,
+        'total_punkte': total, 'pct_5g': pct_5g, 'pct_4g_plus': pct_4g_plus,
+        'pct_2g_plus': pct_2g_plus, 'pct_keine_angabe': pct_keine,
+    }
+
+
+def push_to_supabase(all_results: List[Dict[str, Any]]) -> None:
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        log_step('Supabase nicht konfiguriert (SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY fehlen) — kein Push.')
+        return
+    try:
+        from supabase import create_client
+    except ImportError:
+        log_step("Python-Paket 'supabase' nicht installiert — kein Push. (pip install supabase)")
+        return
+
+    base_url = SUPABASE_URL.split('/rest/')[0] if '/rest/' in SUPABASE_URL else SUPABASE_URL
+    sb = create_client(base_url, SUPABASE_KEY)
+    jahr = datetime.now().year
+
+    for res in all_results:
+        name = res['kommune']
+        kommune_id = res['kommune_id']
+
+        try:
+            sb.table('benchmark').upsert({
+                'kommune_id': kommune_id, 'sicht_nr': 6,
+                'kennzahl': 'Mobilfunk Anteil Fläche ≥4G (%)',
+                'wert_num': res['pct_4g_plus'], 'score_normiert': None,
+                'erhebungsjahr': jahr,
+                'quelle': 'BNetzA Mobilfunk-Monitoring (WMS, BKG-gehostet, anbieterneutral)',
+                'quelle_typ': 'automatisch',
+                'letzter_abruf': datetime.now(timezone.utc).isoformat(),
+            }, on_conflict='kommune_id,sicht_nr,kennzahl,erhebungsjahr').execute()
+
+            sb.table('benchmark').upsert({
+                'kommune_id': kommune_id, 'sicht_nr': 6,
+                'kennzahl': 'Mobilfunk Anteil Fläche 5G (%)',
+                'wert_num': res['pct_5g'], 'score_normiert': None,
+                'erhebungsjahr': jahr,
+                'quelle': 'BNetzA Mobilfunk-Monitoring (WMS, BKG-gehostet, anbieterneutral)',
+                'quelle_typ': 'automatisch',
+                'letzter_abruf': datetime.now(timezone.utc).isoformat(),
+            }, on_conflict='kommune_id,sicht_nr,kennzahl,erhebungsjahr').execute()
+
+            log_step(f"  ✓ {name}: ≥4G={res['pct_4g_plus']}%, 5G={res['pct_5g']}% → Supabase (benchmark)")
+        except Exception as e:
+            log_step(f"  ✗ {name}: Supabase-Fehler (benchmark): {e}")
+
+        try:
+            sb.table('mobilfunk_raster').delete().eq('kommune_id', kommune_id).eq('erhebungsjahr', jahr).execute()
+        except Exception as e:
+            log_step(f"  ⚠ {name}: Löschen alter mobilfunk_raster fehlgeschlagen: {e}")
+
+        punkte = res.get('punkte', [])
+        if not punkte:
+            continue
+        rows = [{
+            'kommune_id': kommune_id, 'lat': p['lat'], 'lng': p['lng'],
+            'technologie': p['tech'], 'klasse': p['klasse'], 'erhebungsjahr': jahr,
+        } for p in punkte]
+        batch_size = 500
+        gespeichert = 0
+        for i in range(0, len(rows), batch_size):
+            batch = rows[i:i + batch_size]
+            try:
+                sb.table('mobilfunk_raster').insert(batch).execute()
+                gespeichert += len(batch)
+            except Exception as e:
+                log_step(f"  ✗ {name}: Fehler beim Speichern von mobilfunk_raster (Batch {i}): {e}")
+        log_step(f"  {name}: {gespeichert}/{len(rows)} Rasterpunkte gespeichert")
+
+
+def main() -> int:
+    cache = load_geo_cache()
+    all_results = []
+    for k in COMMUNES:
+        try:
+            res = process_commune(k, cache)
+            if res:
+                all_results.append(res)
+        except Exception as e:
+            log.error(f"{k['name']}: {e}")
+        time.sleep(2)
+
+    log_step('══ Résumé final ══')
+    for res in all_results:
+        log_step(f"  {res['kommune']}: ≥4G={res['pct_4g_plus']}% · 5G={res['pct_5g']}% · {res['total_punkte']} Punkte")
+
+    push_to_supabase(all_results)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
