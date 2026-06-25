@@ -234,74 +234,98 @@ def webmercator_to_lonlat(x: float, y: float) -> Tuple[float, float]:
     return lng, lat
 
 
-def build_grid(boundary: Dict[str, Any], step_m: float = GRID_STEP_M) -> List[Tuple[float, float]]:
-    """Erzeugt Rasterpunkte (lat, lng) im 500-m-Abstand, deren Zentren innerhalb
-    der echten Gemeindegrenze liegen (Punkt-in-Polygon-Test je Quadratzentrum)."""
-    w, s, e, n = boundary['bbox']
-    x0, y0 = lonlat_to_webmercator(w, s)
-    x1, y1 = lonlat_to_webmercator(e, n)
+# ── Einmaliges Karten-Bild abrufen und Pixel auswerten (statt tausender ──
+# ── Einzelabfragen) — schneller und zuverlässiger als GetFeatureInfo,    ──
+# ── das laut OGC-Spezifikation auch das NÄCHSTGELEGENE Feature liefern   ──
+# ── kann, selbst wenn der angefragte Punkt außerhalb davon liegt.        ──
 
-    points = []
-    y = y0 + step_m / 2
-    while y < y1:
-        x = x0 + step_m / 2
-        while x < x1:
-            lng, lat = webmercator_to_lonlat(x, y)
-            if point_in_geom(lng, lat, boundary['geometry']):
-                points.append((lat, lng))
-            x += step_m
-        y += step_m
-    return points
+IMG_SIZE = 1024  # Pixel je Seite; bei einer Kommune von ~6-8 km Breite
+                 # entspricht das einer Auflösung von ~6-8 m/Pixel, fein
+                 # genug für das amtliche 100-m-Raster.
 
-
-# ── WMS GetFeatureInfo: Abdeckung je Technologie an einem Punkt prüfen ──
-
-def query_wms_coverage(lat: float, lng: float, layer: str) -> bool:
-    """Fragt den BNetzA-WMS via GetFeatureInfo ab, ob am angegebenen Punkt eine
-    Abdeckung für die gegebene Technologie-Schicht (gsm/lte/5g) vorhanden ist.
-    1x1-Pixel-Bildanfrage exakt zentriert auf den Punkt, um Pixel-Rundung zu
-    vermeiden. WMS 1.3.0 nutzt I/J (nicht X/Y) für die Pixel-Koordinaten."""
-    x, y = lonlat_to_webmercator(lng, lat)
-    d = 1.0  # Mini-BBOX von 2m x 2m um den Punkt (Web Mercator, Meter)
-    params = {
-        'SERVICE': 'WMS', 'VERSION': '1.3.0', 'REQUEST': 'GetFeatureInfo',
-        'LAYERS': layer, 'QUERY_LAYERS': layer,
-        'CRS': 'EPSG:3857', 'BBOX': f'{x-d},{y-d},{x+d},{y+d}',
-        'WIDTH': 1, 'HEIGHT': 1, 'I': 0, 'J': 0,
-        'INFO_FORMAT': 'application/json', 'FEATURE_COUNT': 1,
-    }
-    try:
-        r = requests.get(WMS_BASE, params=params, headers={'User-Agent': USER_AGENT}, timeout=TIMEOUT)
-        if r.status_code != 200:
-            return False
-        ctype = r.headers.get('Content-Type', '')
-        if 'json' in ctype:
-            data = r.json()
-            return bool(data.get('features'))
-        # Fallback: manche Server liefern GML/XML statt JSON; grobe Heuristik
-        text = r.text.strip()
-        return bool(text) and '<gml' in text.lower() and 'featureMember' in text
-    except Exception:
-        return False
-
-
-def best_technology(lat: float, lng: float) -> Optional[str]:
-    """Prüft 5G zuerst, dann 4G, dann 2G — gibt die beste verfügbare Technologie
-    zurück (oder None, wenn keine Abdeckung gefunden wurde)."""
-    for tech in ('5G', '4G', '2G'):
-        if query_wms_coverage(lat, lng, WMS_LAYERS[tech]):
-            return tech
+# Farbgrenzen exakt wie in der WMS-Legende/Capabilities-Stilisierung:
+# Stark/Gut-mittel = grün-Töne (abgedeckt), Schwach/Keine Angabe = rot/transparent.
+def classify_pixel(rgba: Tuple[int, int, int, int]) -> Optional[str]:
+    r, g, b, a = rgba
+    if a < 10:
+        return None  # transparent → keine Angabe / außerhalb
+    # Grün dominiert eindeutig über Rot → als "abgedeckt" werten.
+    if g > r and g > 60:
+        return 'covered'
+    if r > g and r > 60:
+        return 'not_covered'
     return None
 
 
-def klass_for_tech(tech: Optional[str]) -> Dict[str, Any]:
-    if tech == '5G':
-        return KLASSEN[0]
-    if tech == '4G':
-        return KLASSEN[1]
-    if tech == '2G':
-        return KLASSEN[2]
-    return KLASSEN[3]
+def fetch_coverage_image(boundary: Dict[str, Any], layer: str) -> Optional[Tuple[Any, List[float]]]:
+    """Holt ein einziges GetMap-Bild für die gesamte BBOX der Kommune und
+    liefert (PIL.Image, bbox_3857) zurück."""
+    from PIL import Image
+    import io
+
+    w, s, e, n = boundary['bbox']
+    x0, y0 = lonlat_to_webmercator(w, s)
+    x1, y1 = lonlat_to_webmercator(e, n)
+    # Etwas Rand (10%) hinzufügen, damit Randpixel der Kommune nicht abgeschnitten werden.
+    pad_x = (x1 - x0) * 0.1
+    pad_y = (y1 - y0) * 0.1
+    bbox3857 = [x0 - pad_x, y0 - pad_y, x1 + pad_x, y1 + pad_y]
+
+    params = {
+        'SERVICE': 'WMS', 'VERSION': '1.3.0', 'REQUEST': 'GetMap',
+        'LAYERS': layer, 'CRS': 'EPSG:3857',
+        'BBOX': ','.join(str(v) for v in bbox3857),
+        'WIDTH': IMG_SIZE, 'HEIGHT': IMG_SIZE,
+        'FORMAT': 'image/png', 'TRANSPARENT': 'true',
+    }
+    try:
+        r = requests.get(WMS_BASE, params=params, headers={'User-Agent': USER_AGENT}, timeout=60)
+        if r.status_code != 200 or 'image' not in r.headers.get('Content-Type', ''):
+            log_step(f"  WARN GetMap fehlgeschlagen: HTTP {r.status_code}, Content-Type={r.headers.get('Content-Type')}")
+            return None
+        img = Image.open(io.BytesIO(r.content)).convert('RGBA')
+        return img, bbox3857
+    except Exception as e:
+        log_step(f"  WARN GetMap-Fehler: {e}")
+        return None
+
+
+def analyze_coverage_image(img: Any, bbox3857: List[float], boundary: Dict[str, Any]) -> Tuple[int, int, int]:
+    """Zählt Pixel innerhalb der echten Gemeindegrenze (Punkt-in-Polygon je
+    Pixelzentrum) als covered / not_covered / unbekannt.
+    Gibt (n_covered, n_not_covered, n_total_in_boundary) zurück."""
+    px = img.load()
+    width, height = img.size
+    x0, y0, x1, y1 = bbox3857
+    span_x = x1 - x0
+    span_y = y1 - y0
+
+    # Stichprobenraster über die Pixel, um Rechenzeit zu sparen: bei 1024x1024
+    # jeden Pixel zu prüfen ist unnötig fein; wir nehmen jeden 4. Pixel
+    # (entspricht weiterhin ca. 25-30 m Auflösung — feiner als die 100-m-Zellen).
+    step = 4
+    n_covered = 0
+    n_not_covered = 0
+    n_total = 0
+
+    for py in range(0, height, step):
+        # Web-Mercator-Y läuft umgekehrt zur Bild-Pixel-Y-Achse (Bild: oben=0, Mercator: oben=max-Y)
+        merc_y = y1 - (py / height) * span_y
+        for pxi in range(0, width, step):
+            merc_x = x0 + (pxi / width) * span_x
+            lng, lat = webmercator_to_lonlat(merc_x, merc_y)
+            if not point_in_geom(lng, lat, boundary['geometry']):
+                continue
+            n_total += 1
+            cls = classify_pixel(px[pxi, py])
+            if cls == 'covered':
+                n_covered += 1
+            elif cls == 'not_covered':
+                n_not_covered += 1
+            # cls is None → weder klar gruen noch klar rot, wird nicht gezaehlt
+            # (z. B. Grenzlinien, Beschriftungen) - faellt unter "unbekannt"
+
+    return n_covered, n_not_covered, n_total
 
 
 # ── Hauptablauf je Kommune ──
@@ -313,36 +337,42 @@ def process_commune(k: Dict[str, Any], cache: Dict[str, Any]) -> Optional[Dict[s
         log_step(f"{name}: keine Gemeindegrenze — überspringe")
         return None
 
-    grid = build_grid(boundary)
-    log_step(f"{name}: {len(grid)} Rasterpunkte (500 m) innerhalb der Gemeindegrenze")
-    if not grid:
-        return None
+    pct_by_tech: Dict[str, float] = {}
+    counts_by_tech: Dict[str, Tuple[int, int, int]] = {}
 
-    results = []
-    for i, (lat, lng) in enumerate(grid):
-        tech = best_technology(lat, lng)
-        results.append({'lat': lat, 'lng': lng, 'tech': tech, 'klasse': klass_for_tech(tech)['label']})
-        if (i + 1) % 10 == 0:
-            log_step(f"{name}: {i+1}/{len(grid)} Punkte geprüft")
-        time.sleep(0.15)  # WMS schonen
+    for tech in ('5G', '4G', '2G'):
+        layer = WMS_LAYERS[tech]
+        log_step(f"{name}: lade Kartenbild für {tech} ({layer}) …")
+        result = fetch_coverage_image(boundary, layer)
+        if not result:
+            pct_by_tech[tech] = 0.0
+            continue
+        img, bbox3857 = result
+        n_cov, n_notcov, n_total = analyze_coverage_image(img, bbox3857, boundary)
+        counts_by_tech[tech] = (n_cov, n_notcov, n_total)
+        pct = round(n_cov / n_total * 100, 1) if n_total else 0.0
+        pct_by_tech[tech] = pct
+        log_step(f"{name}: {tech} → {n_cov}/{n_total} Pixel abgedeckt ({pct}%)")
+        time.sleep(1)  # Server schonen zwischen den 3 Anfragen
 
-    total = len(results)
-    n_5g = sum(1 for r in results if r['tech'] == '5G')
-    n_4g_or_better = sum(1 for r in results if r['tech'] in ('5G', '4G'))
-    n_2g_or_better = sum(1 for r in results if r['tech'] in ('5G', '4G', '2G'))
-    n_keine = sum(1 for r in results if r['tech'] is None)
-
-    pct_5g = round(n_5g / total * 100, 1) if total else 0.0
-    pct_4g_plus = round(n_4g_or_better / total * 100, 1) if total else 0.0
-    pct_2g_plus = round(n_2g_or_better / total * 100, 1) if total else 0.0
-    pct_keine = round(n_keine / total * 100, 1) if total else 0.0
+    pct_5g = pct_by_tech.get('5G', 0.0)
+    pct_4g = pct_by_tech.get('4G', 0.0)
+    pct_2g = pct_by_tech.get('2G', 0.0)
+    # "mindestens diese Technologie" ist nicht exakt aus Einzelwerten ableitbar,
+    # da die Schichten unabhängig voneinander gerendert werden — als Näherung
+    # wird der Maximalwert der drei als "≥2G" verwendet (jede Abdeckung zählt),
+    # und "≥4G" als Maximum aus 4G und 5G.
+    pct_4g_plus = max(pct_4g, pct_5g)
+    pct_2g_plus = max(pct_2g, pct_4g, pct_5g)
+    pct_keine = round(100 - pct_2g_plus, 1)
 
     log_step(f"{name}: 5G={pct_5g}% · ≥4G={pct_4g_plus}% · ≥2G={pct_2g_plus}% · keine Angabe={pct_keine}%")
 
     return {
-        'kommune': name, 'kommune_id': k['kommune_id'], 'punkte': results,
-        'total_punkte': total, 'pct_5g': pct_5g, 'pct_4g_plus': pct_4g_plus,
+        'kommune': name, 'kommune_id': k['kommune_id'],
+        'pct_5g': pct_5g, 'pct_4g_plus': pct_4g_plus,
         'pct_2g_plus': pct_2g_plus, 'pct_keine_angabe': pct_keine,
+        'punkte': [],  # keine Einzelpunkte mehr in diesem Ansatz — Flächenanteil aus Pixelanalyse
     }
 
 
