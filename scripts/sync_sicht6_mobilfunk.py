@@ -243,18 +243,31 @@ IMG_SIZE = 1024  # Pixel je Seite; bei einer Kommune von ~6-8 km Breite
                  # entspricht das einer Auflösung von ~6-8 m/Pixel, fein
                  # genug für das amtliche 100-m-Raster.
 
-# Farbgrenzen exakt wie in der WMS-Legende/Capabilities-Stilisierung:
-# Stark/Gut-mittel = grün-Töne (abgedeckt), Schwach/Keine Angabe = rot/transparent.
-def classify_pixel(rgba: Tuple[int, int, int, int]) -> Optional[str]:
+# Echte, per Legende bestätigte "abgedeckt"-Farben je Layer (RGB).
+# Wichtig: jeder Layer hat eine eigene, unterschiedliche Farbe — eine
+# einheitliche "grün=abgedeckt"-Annahme war falsch und führte zu 0% bei
+# gsm und 5g. Diese Werte stammen direkt aus GetLegendGraphic-Antworten.
+COVERED_COLOR_BY_LAYER = {
+    'gsm': (32, 55, 100),     # 2G: dunkles Marineblau
+    'lte': (102, 153, 255),   # 4G: helles Blau
+    '5g': (255, 130, 0),      # 5G: Orange (5G Standalone-Bereich)
+}
+COLOR_TOLERANCE = 60  # Toleranz je Kanal für Anti-Aliasing/Kompression
+
+
+def classify_pixel(rgba: Tuple[int, int, int, int], layer: str) -> Optional[str]:
     r, g, b, a = rgba
     if a < 10:
-        return None  # transparent → keine Angabe / außerhalb
-    # Grün dominiert eindeutig über Rot → als "abgedeckt" werten.
-    if g > r and g > 60:
+        return None  # transparent → außerhalb der erfassten Fläche / keine Angabe
+    if (r, g, b) == (255, 255, 255):
+        return None  # reines Weiß = Hintergrund/keine Angabe, nicht "nicht abgedeckt"
+    target = COVERED_COLOR_BY_LAYER.get(layer)
+    if target is None:
+        return None
+    tr, tg, tb = target
+    if abs(r - tr) <= COLOR_TOLERANCE and abs(g - tg) <= COLOR_TOLERANCE and abs(b - tb) <= COLOR_TOLERANCE:
         return 'covered'
-    if r > g and r > 60:
-        return 'not_covered'
-    return None
+    return 'not_covered'
 
 
 def fetch_coverage_image(boundary: Dict[str, Any], layer: str) -> Optional[Tuple[Any, List[float]]]:
@@ -290,7 +303,7 @@ def fetch_coverage_image(boundary: Dict[str, Any], layer: str) -> Optional[Tuple
         return None
 
 
-def analyze_coverage_image(img: Any, bbox3857: List[float], boundary: Dict[str, Any]) -> Tuple[int, int, int]:
+def analyze_coverage_image(img: Any, bbox3857: List[float], boundary: Dict[str, Any], layer: str) -> Tuple[int, int, int]:
     """Zählt Pixel innerhalb der echten Gemeindegrenze (Punkt-in-Polygon je
     Pixelzentrum) als covered / not_covered / unbekannt.
     Gibt (n_covered, n_not_covered, n_total_in_boundary) zurück."""
@@ -317,7 +330,7 @@ def analyze_coverage_image(img: Any, bbox3857: List[float], boundary: Dict[str, 
             if not point_in_geom(lng, lat, boundary['geometry']):
                 continue
             n_total += 1
-            cls = classify_pixel(px[pxi, py])
+            cls = classify_pixel(px[pxi, py], layer)
             if cls == 'covered':
                 n_covered += 1
             elif cls == 'not_covered':
@@ -348,7 +361,7 @@ def process_commune(k: Dict[str, Any], cache: Dict[str, Any]) -> Optional[Dict[s
             pct_by_tech[tech] = 0.0
             continue
         img, bbox3857 = result
-        n_cov, n_notcov, n_total = analyze_coverage_image(img, bbox3857, boundary)
+        n_cov, n_notcov, n_total = analyze_coverage_image(img, bbox3857, boundary, layer)
         counts_by_tech[tech] = (n_cov, n_notcov, n_total)
         pct = round(n_cov / n_total * 100, 1) if n_total else 0.0
         pct_by_tech[tech] = pct
@@ -457,7 +470,7 @@ def main() -> int:
 
     log_step('══ Résumé final ══')
     for res in all_results:
-        log_step(f"  {res['kommune']}: ≥4G={res['pct_4g_plus']}% · 5G={res['pct_5g']}% · {res['total_punkte']} Punkte")
+        log_step(f"  {res['kommune']}: ≥4G={res['pct_4g_plus']}% · 5G={res['pct_5g']}% · ≥2G={res['pct_2g_plus']}%")
 
     push_to_supabase(all_results)
     return 0
