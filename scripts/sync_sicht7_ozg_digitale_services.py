@@ -127,11 +127,17 @@ def _headers() -> Dict[str, str]:
     return h
 
 
-def _get(path: str, params: Dict[str, Any]) -> Optional[Any]:
+def _get(path: str, params: Dict[str, Any], leise: bool = False) -> "tuple[Optional[Any], Optional[str]]":
     """
     Ruft einen PVOG-Suchdienst-Endpunkt auf. Probiert zuerst die neue
     Domain (pvog.fitko.net), bei Fehlern die alte (pvog.fitko.de).
-    Gibt das geparste JSON zurück oder None bei Fehlschlag.
+    Gibt immer ein Tupel (daten, fehlermeldung) zurück:
+    - Erfolg:        (json, None)
+    - kein Treffer:  (None, None)   (HTTP 404 - gültiges leeres Ergebnis)
+    - Fehler:        (None, "...")  (inkl. Antwortkörper zur Diagnose)
+    Bei HTTP-Fehlern wird (außer im "leisen" Modus) der Antwortkörper
+    mitgeloggt, da PVOG-Fehlerantworten i.d.R. eine konkrete
+    Validierungsmeldung enthalten (z.B. fehlender/falscher Parameter).
     """
     last_error: Optional[str] = None
     for base in PVOG_BASES:
@@ -139,18 +145,37 @@ def _get(path: str, params: Dict[str, Any]) -> Optional[Any]:
         try:
             r = requests.get(url, params=params, headers=_headers(), timeout=30)
             if r.status_code == 200:
-                return r.json()
+                return r.json(), None
             if r.status_code == 404:
                 # Kein Treffer ist ein gültiges, "leeres" Ergebnis - kein Fehler.
-                return None
-            last_error = f"HTTP {r.status_code} bei {url}"
-            log.warning(f"  ⚠ {last_error}")
+                return None, None
+            body = (r.text or '')[:300].replace('\n', ' ')
+            last_error = f"HTTP {r.status_code} bei {url} — Antwort: {body}"
+            if not leise:
+                log.warning(f"  ⚠ {last_error}")
         except Exception as e:
             last_error = f"{type(e).__name__}: {e}"
-            log.warning(f"  ⚠ Fehler bei {url}: {last_error}")
+            if not leise:
+                log.warning(f"  ⚠ Fehler bei {url}: {last_error}")
         time.sleep(0.5)
-    log.error(f"  ✗ Alle PVOG-Domains fehlgeschlagen ({path}): {last_error}")
-    return None
+    if not leise:
+        log.error(f"  ✗ Alle PVOG-Domains fehlgeschlagen ({path}): {last_error}")
+    return None, last_error
+
+
+# Kandidaten für Endpunkt + Parametername der Ortssuche, in Reihenfolge der
+# Wahrscheinlichkeit. /v3/locations/ars lieferte HTTP 400 mit unklarem
+# Parameter; /v2/locations?q=... ist hingegen aus einer offiziellen
+# BayKommun-Anleitung als funktionierendes Beispiel belegt. Wir probieren
+# daher mehrere Kombinationen automatisch durch und protokollieren bei
+# Bedarf alle Fehlerantworten zur Diagnose.
+LOCATION_KANDIDATEN = [
+    ('/v2/locations', 'q'),
+    ('/v3/locations', 'q'),
+    ('/v3/locations/ars', 'q'),
+    ('/v3/locations/ars', 'search'),
+    ('/v3/locations/ars', 'name'),
+]
 
 
 def resolve_ars(ort_name: str) -> Optional[str]:
@@ -158,19 +183,32 @@ def resolve_ars(ort_name: str) -> Optional[str]:
     Ermittelt den Amtlichen Regionalschlüssel (ARS) zu einem Ortsnamen über
     den PVOG-Ortssuchendienst. Bevorzugt Treffer in Sachsen-Anhalt, falls
     mehrdeutig (gleichnamige Orte in anderen Bundesländern).
+
+    Probiert mehrere Endpunkt-/Parameter-Kombinationen, da die genaue
+    Schnittstelle nicht für alle API-Versionen öffentlich dokumentiert ist
+    und der BKG-Ortsdienst laut FITKO-Statusmeldungen zeitweise instabil ist.
     """
-    data = _get('/v3/locations/ars', {'q': ort_name})
-    if not data:
-        return None
-    # Die API liefert je nach Version entweder direkt eine Liste oder ein
-    # Objekt mit einer Trefferliste - wir behandeln beide Fälle defensiv.
-    treffer = data if isinstance(data, list) else (data.get('results') or data.get('content') or data.get('items') or [])
-    if not treffer:
-        return None
-    bevorzugt = next((t for t in treffer if 'sachsen-anhalt' in str(t).lower()), None)
-    eintrag = bevorzugt or treffer[0]
-    ars = eintrag.get('ars') if isinstance(eintrag, dict) else None
-    return ars
+    fehler_protokoll = []
+    for path, param in LOCATION_KANDIDATEN:
+        data, fehler = _get(path, {param: ort_name}, leise=True)
+        if fehler:
+            fehler_protokoll.append(f"{path}?{param}=... → {fehler}")
+        if not data:
+            continue
+        treffer = data if isinstance(data, list) else (data.get('results') or data.get('content') or data.get('items') or [])
+        if not treffer:
+            continue
+        bevorzugt = next((t for t in treffer if 'sachsen-anhalt' in str(t).lower()), None)
+        eintrag = bevorzugt or treffer[0]
+        ars = eintrag.get('ars') or eintrag.get('ARS') if isinstance(eintrag, dict) else None
+        if ars:
+            log.info(f"  ✓ ARS via {path}?{param}=... aufgelöst")
+            return ars
+    # Alle Kandidaten fehlgeschlagen - vollständiges Protokoll für Diagnose ausgeben.
+    log.error(f"  ✗ ARS-Auflösung für '{ort_name}' fehlgeschlagen über alle Kandidaten:")
+    for zeile in fehler_protokoll:
+        log.error(f"      {zeile}")
+    return None
 
 
 def count_online_services(ars: str) -> Optional[int]:
@@ -187,7 +225,9 @@ def count_online_services(ars: str) -> Optional[int]:
         params: Dict[str, Any] = {'ars': ars}
         if next_token:
             params['nextPageToken'] = next_token
-        data = _get('/v1beta2/onlineservices', params)
+        data, fehler = _get('/v1beta2/onlineservices', params)
+        if fehler:
+            log.warning(f"  ⚠ Online-Dienste-Zählung: {fehler}")
         if data is None:
             break
         if isinstance(data, dict):
@@ -212,9 +252,11 @@ def check_leika_basket(ars: str) -> List[Dict[str, Any]]:
     """
     ergebnisse = []
     for leistung in LEIKA_KORB:
-        data = _get('/v3/servicedescriptions/leikaid', {
+        data, fehler = _get('/v3/servicedescriptions/leikaid', {
             'ars': ars, 'page': 0, 'size': 10, 'leikaIds': leistung['id'],
         })
+        if fehler:
+            log.warning(f"    ⚠ {leistung['name']}: {fehler}")
         treffer = bool(data) and bool(
             data if isinstance(data, list) else (data.get('content') or data.get('results') or [])
         )
