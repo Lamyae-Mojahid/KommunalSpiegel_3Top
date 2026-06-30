@@ -1,0 +1,35 @@
+name: Sync S7 OZG / Digitale Services
+
+on:
+  schedule:
+    - cron: '0 10 1 * *'   # monatlich, am 1. des Monats, 10:00 UTC
+  workflow_dispatch:
+
+jobs:
+  sync-ozg-digitale-services:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          pip install requests supabase
+
+      - name: Run OZG / Digitale Services sync
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # Optional: kostenloser API-Key vom PVOG-Produktportal.
+          # Ohne Key funktioniert die Suchdienst-API laut FITKO ebenfalls,
+          # ein Key wird für künftige Stabilität empfohlen.
+          PVOG_API_KEY: ${{ secrets.PVOG_API_KEY }}
+        run: |
+          python scripts/sync_sicht7_ozg_digitale_services.py
