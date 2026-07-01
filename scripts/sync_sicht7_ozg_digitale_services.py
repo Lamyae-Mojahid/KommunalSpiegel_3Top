@@ -63,6 +63,7 @@ Wichtige Einschränkungen / Hinweise:
 import os
 import sys
 import time
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -211,37 +212,69 @@ def resolve_ars(ort_name: str) -> Optional[str]:
     return None
 
 
-def count_online_services(ars: str) -> Optional[int]:
+def fetch_online_services(ars: str, diagnose: bool = False) -> Dict[str, Any]:
     """
-    Zählt alle für den ARS zuständigen Onlinedienste (inkl. vererbter
+    Ruft alle für den ARS zuständigen Onlinedienste ab (inkl. vererbter
     Zuständigkeiten von Land/Bund) über den Beta-Endpunkt
-    /v1beta2/onlineservices. Folgt nextPageToken, falls mehr als eine
-    Seite Ergebnisse existiert (>1000 Treffer pro Seite laut FITKO-Doku).
+    /v1beta2/onlineservices. Folgt nextPageToken bei mehreren Seiten.
+
+    Gibt zurück: {'total': int|None, 'items': [...] (Rohdaten je Eintrag)}
+
+    Der genaue Feldname der Trefferliste (vermutlich "hits", laut
+    FITKO-Blogpost) ist öffentlich nicht vollständig dokumentiert - daher
+    werden mehrere plausible Feldnamen defensiv geprüft. Mit diagnose=True
+    wird die Rohstruktur des ERSTEN gefundenen Eintrags 1:1 geloggt, damit
+    wir das tatsächliche Antwortschema einmalig sehen und danach sauber
+    zuordnen können (Name, Link, LeiKa-ID o.ä.) - statt zu raten.
     """
     total: Optional[int] = None
+    alle_items: List[Any] = []
     next_token: Optional[str] = None
     seiten = 0
+    erste_diagnose_ausgegeben = False
+
     while True:
         params: Dict[str, Any] = {'ars': ars}
         if next_token:
             params['nextPageToken'] = next_token
         data, fehler = _get('/v1beta2/onlineservices', params)
         if fehler:
-            log.warning(f"  ⚠ Online-Dienste-Zählung: {fehler}")
+            log.warning(f"  ⚠ Online-Dienste-Abfrage: {fehler}")
         if data is None:
             break
-        if isinstance(data, dict):
-            if total is None:
-                total = data.get('totalHits')
-            next_token = data.get('nextPageToken')
-        else:
-            # Unerwartetes Format - sicherheitshalber abbrechen, nicht raten.
-            log.warning("  ⚠ Unerwartetes Antwortformat bei /v1beta2/onlineservices")
+        if not isinstance(data, dict):
+            log.warning("  ⚠ Unerwartetes Antwortformat bei /v1beta2/onlineservices (kein Objekt)")
             break
+
+        if total is None:
+            total = data.get('totalHits')
+
+        if diagnose and not erste_diagnose_ausgegeben:
+            # Komplette Top-Level-Struktur der Antwort zeigen (Schlüsselnamen),
+            # damit wir sehen, wie die Trefferliste tatsächlich heißt.
+            log.info(f"  🔍 DIAGNOSE — Top-Level-Schlüssel der Antwort: {list(data.keys())}")
+
+        # Mehrere plausible Feldnamen für die Trefferliste defensiv prüfen.
+        items = (
+            data.get('hits') or data.get('items') or data.get('results')
+            or data.get('content') or data.get('services') or data.get('onlineServices') or []
+        )
+        if isinstance(items, list):
+            alle_items.extend(items)
+            if diagnose and items and not erste_diagnose_ausgegeben:
+                log.info("  🔍 DIAGNOSE — Rohstruktur des ersten Onlinedienst-Eintrags:")
+                log.info("      " + json.dumps(items[0], ensure_ascii=False, indent=2).replace('\n', '\n      '))
+                erste_diagnose_ausgegeben = True
+
+        next_token = data.get('nextPageToken')
         seiten += 1
         if not next_token or seiten > 20:  # Sicherheitsgrenze gegen Endlosschleifen
             break
-    return total
+
+    if diagnose and not erste_diagnose_ausgegeben:
+        log.warning("  ⚠ DIAGNOSE — Keine Einträge in der Trefferliste gefunden (leeres Ergebnis oder unbekanntes Feld)")
+
+    return {'total': total, 'items': alle_items}
 
 
 def check_leika_basket(ars: str) -> List[Dict[str, Any]]:
@@ -268,7 +301,7 @@ def check_leika_basket(ars: str) -> List[Dict[str, Any]]:
 
 def process_all() -> List[Dict[str, Any]]:
     results = []
-    for k in COMMUNES:
+    for i, k in enumerate(COMMUNES):
         log.info(f"\n[Sicht 7] {k['name']} (AGS {k['ags']})")
         ars = resolve_ars(k['name'])
         if not ars:
@@ -276,11 +309,15 @@ def process_all() -> List[Dict[str, Any]]:
             continue
         log.info(f"  ARS ermittelt: {ars}")
 
-        anzahl = count_online_services(ars)
+        # Diagnose nur bei der ersten Kommune ausgeben - reicht, um das
+        # Antwortschema einmalig zu sehen, ohne die Logs unnötig aufzublähen.
+        online_daten = fetch_online_services(ars, diagnose=(i == 0))
+        anzahl = online_daten['total']
+        items = online_daten['items']
         if anzahl is not None:
-            log.info(f"  Online-Dienste laut PVOG: {anzahl}")
+            log.info(f"  Online-Dienste laut PVOG: {anzahl} (davon {len(items)} Einträge abgerufen)")
         else:
-            log.warning(f"  ⚠ {k['name']}: Online-Dienste-Zählung fehlgeschlagen")
+            log.warning(f"  ⚠ {k['name']}: Online-Dienste-Abfrage fehlgeschlagen")
 
         korb_ergebnisse = check_leika_basket(ars)
         verfuegbar_n = sum(1 for e in korb_ergebnisse if e['verfuegbar'])
@@ -289,6 +326,7 @@ def process_all() -> List[Dict[str, Any]]:
         results.append({
             'kommune': k['name'], 'kommune_id': k['kommune_id'], 'ags': k['ags'], 'ars': ars,
             'anzahl_online_dienste': anzahl,
+            'online_dienste_items': items,
             'leika_korb': korb_ergebnisse,
             'pct_korb_verfuegbar': pct_korb,
         })
