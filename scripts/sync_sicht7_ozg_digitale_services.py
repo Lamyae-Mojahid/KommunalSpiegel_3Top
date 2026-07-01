@@ -302,6 +302,37 @@ def check_leika_basket(ars: str) -> List[Dict[str, Any]]:
     return ergebnisse
 
 
+def klassifiziere_lokale_dienste(items: List[Dict[str, Any]], ars_kommune: str) -> Dict[str, Any]:
+    """
+    Unterscheidet anhand der tatsächlichen PVOG-Antwortstruktur, welche
+    Onlinedienste WIRKLICH für genau diese Kommune registriert sind
+    (serviceDescriptions[].ars enthält exakt den ARS der Kommune) und
+    welche nur "vererbt" sind (ars == Bund "000000000000", Land- oder
+    Kreis-Ebene mit nachfolgenden Nullen).
+
+    Das löst das Problem, dass die reine Gesamtzahl (totalHits) fast
+    überall gleich hoch ist, weil sie hauptsächlich Bund-/Landesdienste
+    zählt, die JEDE Kommune "hat" - unabhängig von eigenem Engagement.
+    """
+    lokale_dienste = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        alle_ars = set()
+        for sd in item.get('serviceDescriptions', []) or []:
+            for a in sd.get('ars', []) or []:
+                alle_ars.add(a)
+        if ars_kommune in alle_ars:
+            link = (item.get('links') or [{}])[0].get('uri', '')
+            lokale_dienste.append({'id': item.get('id'), 'name': item.get('name', '(ohne Namen)'), 'url': link})
+
+    return {
+        'anzahl_lokal': len(lokale_dienste),
+        'anzahl_geerbt': len(items) - len(lokale_dienste),
+        'lokale_dienste': lokale_dienste,
+    }
+
+
 def process_all() -> List[Dict[str, Any]]:
     results = []
     for i, k in enumerate(COMMUNES):
@@ -322,6 +353,14 @@ def process_all() -> List[Dict[str, Any]]:
         else:
             log.warning(f"  ⚠ {k['name']}: Online-Dienste-Abfrage fehlgeschlagen")
 
+        klassifikation = klassifiziere_lokale_dienste(items, ars)
+        log.info(
+            f"  → davon lokal registriert: {klassifikation['anzahl_lokal']} · "
+            f"geerbt (Bund/Land/Kreis): {klassifikation['anzahl_geerbt']}"
+        )
+        for d in klassifikation['lokale_dienste']:
+            log.info(f"      · {d['name']}")
+
         korb_ergebnisse = check_leika_basket(ars)
         verfuegbar_n = sum(1 for e in korb_ergebnisse if e['verfuegbar'])
         pct_korb = round(verfuegbar_n / len(korb_ergebnisse) * 100, 1) if korb_ergebnisse else None
@@ -329,7 +368,9 @@ def process_all() -> List[Dict[str, Any]]:
         results.append({
             'kommune': k['name'], 'kommune_id': k['kommune_id'], 'ags': k['ags'], 'ars': ars,
             'anzahl_online_dienste': anzahl,
-            'online_dienste_items': items,
+            'anzahl_lokal': klassifikation['anzahl_lokal'],
+            'anzahl_geerbt': klassifikation['anzahl_geerbt'],
+            'lokale_dienste': klassifikation['lokale_dienste'],
             'leika_korb': korb_ergebnisse,
             'pct_korb_verfuegbar': pct_korb,
         })
@@ -363,6 +404,42 @@ def push_to_supabase(results: List[Dict[str, Any]]) -> None:
                 'score_normiert': None,  # bewusst nicht normiert, siehe Hinweis im Dateikopf
                 'quelle': f"{quelle_basis} - /v1beta2/onlineservices?ars={res['ars']}",
             })
+
+        if res.get('anzahl_lokal') is not None:
+            zeilen.append({
+                'kennzahl': 'OZG Online-Dienste lokal registriert (Anzahl, PVOG)',
+                'wert_num': float(res['anzahl_lokal']),
+                'score_normiert': None,
+                'quelle': (
+                    f"{quelle_basis} - Filter: serviceDescriptions[].ars == {res['ars']} "
+                    "(nur Einträge, die exakt für diese Kommune hinterlegt sind, ohne "
+                    "von Bund/Land/Kreis vererbte Einträge)"
+                ),
+            })
+            zeilen.append({
+                'kennzahl': 'OZG Online-Dienste geerbt von Bund/Land/Kreis (Anzahl, PVOG)',
+                'wert_num': float(res['anzahl_geerbt']),
+                'score_normiert': None,
+                'quelle': f"{quelle_basis} - totalHits abzüglich lokal registrierter Einträge",
+            })
+
+        # Eine Zeile je lokal registriertem Dienst - nur für WIRKLICH lokale
+        # Einträge, da deren Anzahl im Gegensatz zu totalHits überschaubar
+        # sein sollte. Sicherheitsgrenze gegen unerwartete Ausreißer.
+        MAX_EINZELDIENSTE = 100
+        for d in res.get('lokale_dienste', [])[:MAX_EINZELDIENSTE]:
+            zeilen.append({
+                'kennzahl': f"OZG lokaler Online-Dienst: {d['name']}",
+                'wert_num': 1.0,
+                'score_normiert': None,
+                'quelle': f"{quelle_basis} - PVOG-ID {d['id']}" + (f" - {d['url']}" if d['url'] else ''),
+            })
+        if len(res.get('lokale_dienste', [])) > MAX_EINZELDIENSTE:
+            log.warning(
+                f"  ⚠ {name}: {len(res['lokale_dienste'])} lokale Dienste gefunden, "
+                f"nur die ersten {MAX_EINZELDIENSTE} werden als Einzelzeilen gespeichert "
+                "(Summenkennzahl 'lokal registriert' bleibt korrekt)"
+            )
 
         for eintrag in res['leika_korb']:
             zeilen.append({
@@ -405,7 +482,8 @@ def main() -> int:
     for res in results:
         log.info(
             f"  {res['kommune']}: ARS={res['ars']} · "
-            f"Online-Dienste={res['anzahl_online_dienste']} · "
+            f"Online-Dienste={res['anzahl_online_dienste']} "
+            f"(lokal={res.get('anzahl_lokal')} · geerbt={res.get('anzahl_geerbt')}) · "
             f"Korb-Verfügbarkeit={res['pct_korb_verfuegbar']}%"
         )
 
