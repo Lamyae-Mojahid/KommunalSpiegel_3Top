@@ -71,14 +71,25 @@ interface KommuneData {
   massnahmen: any[]
 }
 
-const SICHTEN = [
+const SICHTEN: { nr: number; label: string; kurz: string; schicht: string; einheit: string; hinweis?: string }[] = [
   { nr: 1, label: 'IGEK-Abdeckung',    kurz: 'IGEK',    schicht: 'Strategie', einheit: 'Sichten/10' },
   { nr: 2, label: 'Virtuelle Touren',  kurz: 'Touren',  schicht: 'Plattform', einheit: 'pro 1.000 EW' },
   { nr: 3, label: '360° Streetview',   kurz: '360°',    schicht: 'Plattform', einheit: '% Straßennetz' },
   { nr: 4, label: 'Ladeinfrastruktur', kurz: 'Laden',   schicht: 'Plattform', einheit: 'Plätze/1.000EW' },
   { nr: 5, label: 'Festnetz',          kurz: 'Festnetz',schicht: 'Plattform', einheit: 'Mbit/s' },
   { nr: 6, label: 'Mobilfunk',         kurz: 'Mobil',   schicht: 'Plattform', einheit: 'dBm' },
-  { nr: 7, label: 'Digitale Services', kurz: 'E-Gov',   schicht: 'Plattform', einheit: 'Reifegrad' },
+  {
+    nr: 7, label: 'Digitale Services', kurz: 'E-Gov', schicht: 'Plattform', einheit: 'Reifegrad',
+    // Methodischer Hinweis: Die automatisierten PVOG-Kennzahlen ("lokal
+    // registrierte Online-Dienste") sind eine andere, engere Messung als
+    // die ursprüngliche manuelle Reifegrad-Erhebung (0-4 je Einzelleistung,
+    // rg/ab2). Das PVOG erkennt nur, OB eine Leistung offiziell als
+    // Online-Dienst registriert ist - nicht WIE digital sie tatsächlich
+    // ist (Stufe 0/1 sind für das PVOG nicht unterscheidbar, ebenso wenig
+    // Stufe 2/3/4). Beide Quellen widersprechen sich nicht, sie decken
+    // aber unterschiedliche Ausschnitte derselben Fragestellung ab.
+    hinweis: 'PVOG-Daten zeigen offiziell registrierte Online-Dienste (ja/nein je Kommune), aber keine Qualitätsstufen 0–4. Sie ergänzen die manuelle Reifegrad-Erhebung, ersetzen sie aber nicht vollständig.',
+  },
   { nr: 8, label: 'Social Media',      kurz: 'Social',  schicht: 'Netzwerk',  einheit: 'Kanaldichte' },
 ]
 
@@ -330,6 +341,12 @@ export default function DetailProfile({
                   <div className="ks-sicht-foot">
                     <span className="mono-label">{ampelOf(v) === 'gruen' ? 'stark' : ampelOf(v) === 'gelb' ? 'mittel' : 'schwach'}</span>
                   </div>
+                  {/* Methodischer Hinweis, z.B. für Sicht 7 (PVOG vs. manuelle Erhebung) */}
+                  {s.hinweis && (
+                    <div style={{ marginTop: 8, fontSize: 12.5, lineHeight: 1.4, color: 'var(--ink-4)', fontStyle: 'italic' }}>
+                      ⓘ {s.hinweis}
+                    </div>
+                  )}
                 </div>
               )
             })}
