@@ -255,8 +255,11 @@ def fetch_online_services(ars: str, diagnose: bool = False) -> Dict[str, Any]:
             log.info(f"  🔍 DIAGNOSE — Top-Level-Schlüssel der Antwort: {list(data.keys())}")
 
         # Mehrere plausible Feldnamen für die Trefferliste defensiv prüfen.
+        # Per Diagnose bestätigt: der tatsächliche Feldname ist
+        # "onlineservices" (Kleinschreibung) - "hits" existiert als
+        # Schlüssel, war in unseren Tests aber leer.
         items = (
-            data.get('hits') or data.get('items') or data.get('results')
+            data.get('onlineservices') or data.get('hits') or data.get('items') or data.get('results')
             or data.get('content') or data.get('services') or data.get('onlineServices') or []
         )
         if isinstance(items, list):
